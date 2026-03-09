@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: pretty2-dashboard
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn dashboard:app --bind 0.0.0.0:$PORT --timeout 120 --workers 2
+    envVars:
+      - key: EU_REFRESH_TOKEN
+        sync: false
+      - key: EU_LWA_CLIENT_ID
+        sync: false
+      - key: EU_LWA_CLIENT_SECRET
+        sync: false
+      - key: NA_REFRESH_TOKEN
+        sync: false
+      - key: NA_LWA_CLIENT_ID
+        sync: false
+      - key: NA_LWA_CLIENT_SECRET
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.0
