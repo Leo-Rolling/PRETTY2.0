@@ -297,8 +297,12 @@ def fetch_shipment_plan(wh_key):
 # ── startup scan ─────────────────────────────────────────────────────
 
 print("Scanning all warehouses for SKU list...")
-SKU_CACHE = scan_all_skus()
-print(f"Found {len(SKU_CACHE)} unique ASINs")
+try:
+    SKU_CACHE = scan_all_skus()
+    print(f"Found {len(SKU_CACHE)} unique ASINs")
+except Exception as e:
+    print(f"Warning: SKU scan failed ({e}), will retry on first request")
+    SKU_CACHE = {}
 
 
 # ── shared CSS + nav ─────────────────────────────────────────────────
@@ -656,6 +660,12 @@ SHIPMENT_TEMPLATE = """
 
 @app.route("/")
 def dashboard():
+    global SKU_CACHE
+    if not SKU_CACHE:
+        try:
+            SKU_CACHE = scan_all_skus()
+        except Exception:
+            pass
     selected_asin = request.args.get("asin", "")
     sku_list = sorted(SKU_CACHE.values(), key=lambda x: x["sku"])
     data = None
