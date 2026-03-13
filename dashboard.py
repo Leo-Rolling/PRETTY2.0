@@ -294,15 +294,9 @@ def fetch_shipment_plan(wh_key):
     return shipments
 
 
-# ── startup scan ─────────────────────────────────────────────────────
+# ── lazy SKU cache (loaded on first request, not at startup) ─────────
 
-print("Scanning all warehouses for SKU list...")
-try:
-    SKU_CACHE = scan_all_skus()
-    print(f"Found {len(SKU_CACHE)} unique ASINs")
-except Exception as e:
-    print(f"Warning: SKU scan failed ({e}), will retry on first request")
-    SKU_CACHE = {}
+SKU_CACHE = {}
 
 
 # ── shared CSS + nav ─────────────────────────────────────────────────
