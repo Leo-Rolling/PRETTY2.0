@@ -3,6 +3,9 @@ import json
 import time
 import copy
 import threading
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 from flask import Flask, render_template_string, request, jsonify
 from dotenv import load_dotenv
@@ -16,6 +19,13 @@ app = Flask(__name__)
 
 SAFETY_STOCK_DAYS = 90
 CACHE_REFRESH_MINUTES = 10
+
+# ── Email config ──────────────────────────────────────────────────────
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+ALERT_RECIPIENTS = ["leonardo@rollingsquare.com", "lorenzo@rollingsquare.com", "andrea@rollingsquare.com"]
 
 SHIPPING = {
     "AIR":   {"lead_days": 10, "min_duration": {"EU": 30, "UK": 30, "US": 30, "CA": 30}},
@@ -413,7 +423,17 @@ NAV_HTML = """
 <div class="nav">
     <a href="/" class="{{ 'active' if page == 'sku' else '' }}">SKU View</a>
     <a href="/shipments" class="{{ 'active' if page == 'shipments' else '' }}">Shipment Planner</a>
+    <a href="#" onclick="sendAlert()" style="background:#7f1d1d;border-color:#ef4444;color:#fca5a5;">Send Alert Email</a>
+    <a href="/preview-alert" target="_blank" style="border-color:#6b7280;">Preview Alert</a>
 </div>
+<script>
+function sendAlert(){
+    if(!confirm('Send stock alert email to leonardo@, lorenzo@, andrea@rollingsquare.com?')) return;
+    fetch('/send-alert').then(r=>r.json()).then(d=>{
+        alert(d.message);
+    });
+}
+</script>
 """
 
 
@@ -936,6 +956,195 @@ def cache_status():
             "cached_asins": len(DATA_CACHE["sku_data"]),
             "cached_warehouses": list(DATA_CACHE["shipment_plans"].keys()),
         })
+
+
+# ── Email Alert ───────────────────────────────────────────────────────
+
+def _build_alert_html():
+    """Build HTML email with priority stock alerts from cached data."""
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+    # Collect all urgent items across all warehouses
+    alerts = []  # (priority_score, wh_key, asin, sku, product, method, units, days_to_act, stock, velocity, days_left)
+
+    with _cache_lock:
+        sku_data = copy.deepcopy(DATA_CACHE["sku_data"])
+        skus_info = copy.deepcopy(DATA_CACHE["skus"])
+
+    for asin, (data, product_name, sku) in sku_data.items():
+        for wh_key, wh in data.items():
+            velocity = wh.get("velocity", 0)
+            stock = wh.get("stock", 0)
+            days_left = wh.get("days_left", float("inf"))
+            for m in wh.get("methods", []):
+                if m["units_needed"] > 0:
+                    days_to_act = m["days_to_act"]
+                    # Priority: lower days_to_act = higher priority
+                    score = days_to_act if days_to_act != float("inf") else 99999
+                    alerts.append({
+                        "score": score,
+                        "wh": wh_key,
+                        "asin": asin,
+                        "sku": sku,
+                        "product": (product_name or "")[:50],
+                        "method": m["method"],
+                        "units": m["units_needed"],
+                        "days_to_act": days_to_act,
+                        "stock": stock,
+                        "velocity": velocity,
+                        "days_left": days_left,
+                        "urgent": m["urgent"],
+                    })
+
+    alerts.sort(key=lambda x: x["score"])
+
+    if not alerts:
+        return None  # Nothing to alert about
+
+    # Count urgencies
+    critical = [a for a in alerts if a["urgent"]]
+    warning = [a for a in alerts if not a["urgent"] and a["days_to_act"] != float("inf") and a["days_to_act"] <= 14]
+
+    # Build HTML email
+    html = f"""
+    <html>
+    <head><style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f1117; color: #e0e0e0; padding: 24px; }}
+        h1 {{ color: #fff; font-size: 22px; text-align: center; margin-bottom: 4px; }}
+        .subtitle {{ text-align: center; color: #6b7280; font-size: 13px; margin-bottom: 20px; }}
+        .summary {{ display: flex; justify-content: center; gap: 16px; margin-bottom: 24px; }}
+        .stat {{ background: #1a1d27; border-radius: 8px; padding: 14px 24px; text-align: center; }}
+        .stat .num {{ font-size: 28px; font-weight: 700; }}
+        .stat .lbl {{ font-size: 11px; color: #6b7280; text-transform: uppercase; }}
+        .stat.critical .num {{ color: #ef4444; }}
+        .stat.warning .num {{ color: #f59e0b; }}
+        .stat.total .num {{ color: #3b82f6; }}
+        table {{ width: 100%; border-collapse: collapse; margin-bottom: 16px; }}
+        th {{ background: #161822; color: #6b7280; font-weight: 600; text-transform: uppercase; font-size: 10px; padding: 10px 8px; text-align: center; border-bottom: 2px solid #2d3040; }}
+        th:first-child {{ text-align: left; }}
+        td {{ padding: 10px 8px; text-align: center; border-bottom: 1px solid #1e2130; font-size: 13px; color: #d1d5db; }}
+        td:first-child {{ text-align: left; }}
+        .badge {{ padding: 4px 10px; border-radius: 4px; font-size: 11px; font-weight: 700; display: inline-block; }}
+        .badge-critical {{ background: #7f1d1d; color: #fca5a5; }}
+        .badge-warning {{ background: #78350f; color: #fcd34d; }}
+        .badge-ok {{ background: #064e3b; color: #6ee7b7; }}
+        .method-air {{ color: #60a5fa; font-weight: 700; }}
+        .method-truck {{ color: #f59e0b; font-weight: 700; }}
+        .method-sea {{ color: #10b981; font-weight: 700; }}
+        .wh {{ font-weight: 700; }}
+        .wh-EU {{ color: #3b82f6; }}
+        .wh-UK {{ color: #8b5cf6; }}
+        .wh-US {{ color: #f59e0b; }}
+        .wh-CA {{ color: #ef4444; }}
+        .footer {{ text-align: center; color: #4b5563; font-size: 11px; margin-top: 20px; }}
+        .section-title {{ font-size: 16px; font-weight: 700; margin: 20px 0 12px; padding-bottom: 8px; border-bottom: 2px solid #2d3040; }}
+        .section-title.critical {{ color: #ef4444; }}
+        .section-title.warning {{ color: #f59e0b; }}
+        .section-title.other {{ color: #3b82f6; }}
+    </style></head>
+    <body>
+        <h1>PRETTY 2.0 — Stock Alert</h1>
+        <p class="subtitle">Generated {now}</p>
+
+        <table><tr>
+            <td class="stat critical" style="background:#1a1d27;border-radius:8px;"><div class="num" style="font-size:28px;font-weight:700;color:#ef4444;">{len(critical)}</div><div class="lbl" style="font-size:11px;color:#6b7280;">CRITICAL</div></td>
+            <td class="stat warning" style="background:#1a1d27;border-radius:8px;"><div class="num" style="font-size:28px;font-weight:700;color:#f59e0b;">{len(warning)}</div><div class="lbl" style="font-size:11px;color:#6b7280;">WARNING</div></td>
+            <td class="stat total" style="background:#1a1d27;border-radius:8px;"><div class="num" style="font-size:28px;font-weight:700;color:#3b82f6;">{len(alerts)}</div><div class="lbl" style="font-size:11px;color:#6b7280;">TOTAL</div></td>
+        </tr></table>
+    """
+
+    def _render_table(items):
+        if not items:
+            return "<p style='color:#4b5563;text-align:center;padding:12px;'>None</p>"
+        rows = ""
+        for a in items:
+            wh_class = f"wh-{a['wh']}"
+            method_class = f"method-{a['method'].lower()}"
+            dl = f"{a['days_left']}d" if a['days_left'] != float('inf') else "∞"
+            dta = f"{a['days_to_act']}d" if a['days_to_act'] != float('inf') else "N/A"
+            if a['urgent']:
+                badge = '<span class="badge badge-critical">SEND NOW</span>'
+            elif a['days_to_act'] != float('inf') and a['days_to_act'] <= 14:
+                badge = f'<span class="badge badge-warning">{dta} left</span>'
+            else:
+                badge = f'<span class="badge badge-ok">{dta} left</span>'
+            rows += f"""<tr>
+                <td><span class="wh {wh_class}">{a['wh']}</span></td>
+                <td style="text-align:left;font-weight:600;">{a['sku']}</td>
+                <td style="color:#6b7280;font-family:monospace;font-size:11px;">{a['asin']}</td>
+                <td style="color:#10b981;font-weight:600;">{a['stock']}</td>
+                <td style="color:#f59e0b;font-weight:600;">{a['velocity']}/d</td>
+                <td>{dl}</td>
+                <td><span class="{method_class}">{a['method']}</span></td>
+                <td style="font-size:15px;font-weight:700;">{a['units']}</td>
+                <td>{badge}</td>
+            </tr>"""
+        return f"""<table>
+            <thead><tr>
+                <th>WH</th><th style="text-align:left;">SKU</th><th>ASIN</th>
+                <th>Stock</th><th>Velocity</th><th>Real Stock</th>
+                <th>Channel</th><th>Units to Send</th><th>Action</th>
+            </tr></thead>
+            <tbody>{rows}</tbody>
+        </table>"""
+
+    if critical:
+        html += f'<div class="section-title critical">CRITICAL — Send Now ({len(critical)} items)</div>'
+        html += _render_table(critical)
+
+    if warning:
+        html += f'<div class="section-title warning">WARNING — Less than 14 days ({len(warning)} items)</div>'
+        html += _render_table(warning)
+
+    other = [a for a in alerts if not a["urgent"] and not (a["days_to_act"] != float("inf") and a["days_to_act"] <= 14)]
+    if other:
+        html += f'<div class="section-title other">PLANNED — Upcoming shipments ({len(other)} items)</div>'
+        html += _render_table(other)
+
+    html += f'<p class="footer">PRETTY 2.0 Replenishment Dashboard — Auto-generated alert</p></body></html>'
+    return html
+
+
+def _send_alert_email():
+    """Send stock alert email to all recipients."""
+    if not SMTP_USER or not SMTP_PASS:
+        return {"status": "error", "message": "SMTP credentials not configured. Set SMTP_USER and SMTP_PASS environment variables."}
+
+    html = _build_alert_html()
+    if not html:
+        return {"status": "ok", "message": "No items need replenishment — no alert sent."}
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"⚠️ PRETTY 2.0 — Stock Alert {datetime.utcnow().strftime('%Y-%m-%d')}"
+        msg["From"] = SMTP_USER
+        msg["To"] = ", ".join(ALERT_RECIPIENTS)
+        msg.attach(MIMEText(html, "html"))
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_USER, ALERT_RECIPIENTS, msg.as_string())
+
+        return {"status": "ok", "message": f"Alert sent to {len(ALERT_RECIPIENTS)} recipients."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.route("/send-alert")
+def send_alert():
+    """Send stock alert email now."""
+    result = _send_alert_email()
+    return jsonify(result)
+
+
+@app.route("/preview-alert")
+def preview_alert():
+    """Preview the alert email in browser."""
+    html = _build_alert_html()
+    if not html:
+        return "No items need replenishment — nothing to show.", 200
+    return html
 
 
 if __name__ == "__main__":
