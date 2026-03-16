@@ -3,9 +3,7 @@ import json
 import time
 import copy
 import threading
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import resend
 from datetime import datetime, timedelta
 from flask import Flask, render_template_string, request, jsonify
 from dotenv import load_dotenv
@@ -20,11 +18,8 @@ app = Flask(__name__)
 SAFETY_STOCK_DAYS = 90
 CACHE_REFRESH_MINUTES = 10
 
-# ── Email config ──────────────────────────────────────────────────────
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
+# ── Email config (Resend) ─────────────────────────────────────────────
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 ALERT_RECIPIENTS = ["leonardo@rollingsquare.com", "lorenzo@rollingsquare.com", "andrea@rollingsquare.com"]
 
 SHIPPING = {
@@ -1106,26 +1101,22 @@ def _build_alert_html():
 
 
 def _send_alert_email():
-    """Send stock alert email to all recipients."""
-    if not SMTP_USER or not SMTP_PASS:
-        return {"status": "error", "message": "SMTP credentials not configured. Set SMTP_USER and SMTP_PASS environment variables."}
+    """Send stock alert email to all recipients via Resend."""
+    if not RESEND_API_KEY:
+        return {"status": "error", "message": "RESEND_API_KEY not configured."}
 
     html = _build_alert_html()
     if not html:
         return {"status": "ok", "message": "No items need replenishment — no alert sent."}
 
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"⚠️ PRETTY 2.0 — Stock Alert {datetime.utcnow().strftime('%Y-%m-%d')}"
-        msg["From"] = SMTP_USER
-        msg["To"] = ", ".join(ALERT_RECIPIENTS)
-        msg.attach(MIMEText(html, "html"))
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_USER, ALERT_RECIPIENTS, msg.as_string())
-
+        resend.api_key = RESEND_API_KEY
+        r = resend.Emails.send({
+            "from": "PRETTY 2.0 <onboarding@resend.dev>",
+            "to": ALERT_RECIPIENTS,
+            "subject": f"⚠️ PRETTY 2.0 — Stock Alert {datetime.utcnow().strftime('%Y-%m-%d')}",
+            "html": html,
+        })
         return {"status": "ok", "message": f"Alert sent to {len(ALERT_RECIPIENTS)} recipients."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
