@@ -1,6 +1,8 @@
 import os
 import json
 import time
+import copy
+import threading
 from datetime import datetime, timedelta
 from flask import Flask, render_template_string, request, jsonify
 from dotenv import load_dotenv
@@ -13,6 +15,7 @@ load_dotenv()
 app = Flask(__name__)
 
 SAFETY_STOCK_DAYS = 90
+CACHE_REFRESH_MINUTES = 10
 
 SHIPPING = {
     "AIR":   {"lead_days": 10, "min_duration": {"EU": 30, "UK": 30, "US": 30, "CA": 30}},
@@ -294,9 +297,81 @@ def fetch_shipment_plan(wh_key):
     return shipments
 
 
-# ── lazy SKU cache (loaded on first request, not at startup) ─────────
+# ── Data Cache ────────────────────────────────────────────────────────
 
-SKU_CACHE = {}
+DATA_CACHE = {
+    "skus": {},                # SKU list
+    "sku_data": {},            # per-ASIN data: {asin: (data, product_name, sku)}
+    "shipment_plans": {},      # per-warehouse: {wh_key: shipments_dict}
+    "last_refresh": None,      # datetime of last full refresh
+    "refreshing": False,       # True while background refresh is running
+}
+_cache_lock = threading.Lock()
+
+
+def _refresh_cache():
+    """Background task: refresh all data from Amazon APIs."""
+    with _cache_lock:
+        if DATA_CACHE["refreshing"]:
+            return
+        DATA_CACHE["refreshing"] = True
+
+    try:
+        print("[Cache] Starting full refresh...")
+        start = time.time()
+
+        # 1) Scan all SKUs
+        skus = scan_all_skus()
+        with _cache_lock:
+            DATA_CACHE["skus"] = skus
+
+        # 2) Fetch data for each ASIN
+        for asin in list(skus.keys()):
+            try:
+                data, product_name, sku = fetch_data_for_asin(asin)
+                with _cache_lock:
+                    DATA_CACHE["sku_data"][asin] = (data, product_name, sku)
+            except Exception as e:
+                print(f"[Cache] Error fetching ASIN {asin}: {e}")
+
+        # 3) Fetch shipment plans for each warehouse
+        for wh_key in WAREHOUSES:
+            try:
+                plan = fetch_shipment_plan(wh_key)
+                with _cache_lock:
+                    DATA_CACHE["shipment_plans"][wh_key] = plan
+            except Exception as e:
+                print(f"[Cache] Error fetching shipment plan {wh_key}: {e}")
+
+        elapsed = round(time.time() - start, 1)
+        with _cache_lock:
+            DATA_CACHE["last_refresh"] = datetime.utcnow()
+            DATA_CACHE["refreshing"] = False
+        print(f"[Cache] Refresh complete in {elapsed}s — {len(skus)} ASINs cached")
+
+    except Exception as e:
+        print(f"[Cache] Refresh failed: {e}")
+        with _cache_lock:
+            DATA_CACHE["refreshing"] = False
+
+    # Schedule next refresh
+    _schedule_refresh()
+
+
+def _schedule_refresh():
+    t = threading.Timer(CACHE_REFRESH_MINUTES * 60, _refresh_cache)
+    t.daemon = True
+    t.start()
+
+
+def _ensure_cache():
+    """Trigger first refresh if cache is empty (non-blocking after first call)."""
+    with _cache_lock:
+        if DATA_CACHE["last_refresh"] is not None or DATA_CACHE["refreshing"]:
+            return
+    # First time: start background refresh
+    thread = threading.Thread(target=_refresh_cache, daemon=True)
+    thread.start()
 
 
 # ── shared CSS + nav ─────────────────────────────────────────────────
@@ -479,7 +554,12 @@ SKU_TEMPLATE = """
         <div class="no-data">Select a product from the dropdown to view replenishment data.</div>
         {% endif %}
     </div>
-    <p class="timestamp">Last refreshed: {{ timestamp }}</p>
+    <div class="timestamp">
+        Data cached: {{ timestamp }}
+        {% if refreshing %}<span style="color:#f59e0b;"> &bull; Refreshing in background...</span>{% endif %}
+        &middot; Auto-refresh every {{ cache_minutes }}min
+        &middot; <a href="#" onclick="triggerRefresh()" style="color:#3b82f6;text-decoration:none;">Refresh Now</a>
+    </div>
     <script>
         function loadData() {
             var asin = document.getElementById('skuSelect').value;
@@ -488,6 +568,11 @@ SKU_TEMPLATE = """
             document.getElementById('refreshBtn').textContent = 'Loading...';
             document.getElementById('content').innerHTML = '<div class="loading"><span class="spinner"></span>Fetching from Amazon APIs... (30-60s)</div>';
             window.location.href = '/?asin=' + asin;
+        }
+        function triggerRefresh() {
+            fetch('/refresh').then(r => r.json()).then(d => {
+                alert(d.status === 'already refreshing' ? 'Already refreshing...' : 'Background refresh started! Data will update in a few minutes.');
+            });
         }
     </script>
 </body>
@@ -644,7 +729,12 @@ SHIPMENT_TEMPLATE = """
     <div class="no-data">Select a warehouse above to see all ASINs that need replenishment, grouped by shipping channel.</div>
     {% endif %}
 
-    <p class="timestamp">Last refreshed: {{ timestamp }}</p>
+    <div class="timestamp">
+        Data cached: {{ timestamp }}
+        {% if refreshing %}<span style="color:#f59e0b;"> &bull; Refreshing in background...</span>{% endif %}
+        &middot; Auto-refresh every {{ cache_minutes }}min
+        &middot; <a href="#" onclick="fetch('/refresh').then(r=>r.json()).then(d=>alert(d.status==='already refreshing'?'Already refreshing...':'Refresh started!'))" style="color:#3b82f6;text-decoration:none;">Refresh Now</a>
+    </div>
 </body>
 </html>
 """
@@ -652,49 +742,91 @@ SHIPMENT_TEMPLATE = """
 
 # ── routes ───────────────────────────────────────────────────────────
 
+def _convert_inf(data):
+    """Convert float('inf') to 'inf' string for templates."""
+    data = copy.deepcopy(data)
+    for wh_key in data:
+        wh = data[wh_key]
+        if wh["duration"] == float("inf"):
+            wh["duration"] = "inf"
+        if wh["days_left"] == float("inf"):
+            wh["days_left"] = "inf"
+        for m in wh["methods"]:
+            if m["days_to_act"] == float("inf"):
+                m["days_to_act"] = "inf"
+    return data
+
+
 @app.route("/")
 def dashboard():
-    global SKU_CACHE
-    if not SKU_CACHE:
-        try:
-            SKU_CACHE = scan_all_skus()
-        except Exception:
-            pass
+    _ensure_cache()
+
     selected_asin = request.args.get("asin", "")
-    sku_list = sorted(SKU_CACHE.values(), key=lambda x: x["sku"])
+    force = request.args.get("force", "")
+
+    with _cache_lock:
+        sku_list = sorted(DATA_CACHE["skus"].values(), key=lambda x: x["sku"])
+        last_refresh = DATA_CACHE["last_refresh"]
+        refreshing = DATA_CACHE["refreshing"]
+
     data = None
     product_name = ""
     sku = ""
+
     if selected_asin:
-        data, product_name, sku = fetch_data_for_asin(selected_asin)
-        for wh_key in data:
-            wh = data[wh_key]
-            if wh["duration"] == float("inf"):
-                wh["duration"] = "inf"
-            if wh["days_left"] == float("inf"):
-                wh["days_left"] = "inf"
-            for m in wh["methods"]:
-                if m["days_to_act"] == float("inf"):
-                    m["days_to_act"] = "inf"
+        with _cache_lock:
+            cached = DATA_CACHE["sku_data"].get(selected_asin)
+
+        if cached and not force:
+            # Serve from cache — instant!
+            data, product_name, sku = cached
+            data = _convert_inf(data)
+        else:
+            # ASIN not in cache yet (or force refresh) — fetch live
+            data, product_name, sku = fetch_data_for_asin(selected_asin)
+            with _cache_lock:
+                DATA_CACHE["sku_data"][selected_asin] = (data, product_name, sku)
+            data = _convert_inf(data)
+
     wh_labels = {k: v["label"] for k, v in WAREHOUSES.items()}
+    if last_refresh:
+        ts = last_refresh.strftime("%Y-%m-%d %H:%M UTC")
+    else:
+        ts = "Loading first data..." if refreshing else "No data yet"
+
     return render_template_string(
         SKU_TEMPLATE,
         page="sku",
         sku_list=sku_list, selected_asin=selected_asin,
         data=data, product_name=product_name[:80] if product_name else "", sku=sku,
         safety_days=SAFETY_STOCK_DAYS, wh_labels=wh_labels,
-        timestamp=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+        timestamp=ts, refreshing=refreshing, cache_minutes=CACHE_REFRESH_MINUTES,
     )
 
 
 @app.route("/shipments")
 def shipments():
+    _ensure_cache()
+
     selected_wh = request.args.get("wh", "")
+    force = request.args.get("force", "")
     wh_labels = {k: v["label"] for k, v in WAREHOUSES.items()}
     shipments_data = None
 
     if selected_wh and selected_wh in WAREHOUSES:
-        shipments_data = fetch_shipment_plan(selected_wh)
+        with _cache_lock:
+            cached = DATA_CACHE["shipment_plans"].get(selected_wh)
+
+        if cached and not force:
+            # Serve from cache — instant!
+            shipments_data = copy.deepcopy(cached)
+        else:
+            # Not cached yet (or force refresh) — fetch live
+            shipments_data = fetch_shipment_plan(selected_wh)
+            with _cache_lock:
+                DATA_CACHE["shipment_plans"][selected_wh] = shipments_data
+            shipments_data = copy.deepcopy(shipments_data)
+
         # Convert inf for template
         for method in shipments_data:
             for r in shipments_data[method]:
@@ -705,14 +837,46 @@ def shipments():
                 if r["days_to_act"] == float("inf"):
                     r["days_to_act"] = "inf"
 
+    with _cache_lock:
+        last_refresh = DATA_CACHE["last_refresh"]
+        refreshing = DATA_CACHE["refreshing"]
+
+    if last_refresh:
+        ts = last_refresh.strftime("%Y-%m-%d %H:%M UTC")
+    else:
+        ts = "Loading first data..." if refreshing else "No data yet"
+
     return render_template_string(
         SHIPMENT_TEMPLATE,
         page="shipments",
         selected_wh=selected_wh,
         shipments=shipments_data,
         wh_labels=wh_labels,
-        timestamp=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+        timestamp=ts, refreshing=refreshing, cache_minutes=CACHE_REFRESH_MINUTES,
     )
+
+
+@app.route("/refresh")
+def force_refresh():
+    """Trigger a manual cache refresh in background."""
+    with _cache_lock:
+        if DATA_CACHE["refreshing"]:
+            return jsonify({"status": "already refreshing"})
+    thread = threading.Thread(target=_refresh_cache, daemon=True)
+    thread.start()
+    return jsonify({"status": "refresh started"})
+
+
+@app.route("/api/status")
+def cache_status():
+    """Return cache status as JSON (for auto-refresh UI)."""
+    with _cache_lock:
+        return jsonify({
+            "refreshing": DATA_CACHE["refreshing"],
+            "last_refresh": DATA_CACHE["last_refresh"].strftime("%Y-%m-%d %H:%M UTC") if DATA_CACHE["last_refresh"] else None,
+            "cached_asins": len(DATA_CACHE["sku_data"]),
+            "cached_warehouses": list(DATA_CACHE["shipment_plans"].keys()),
+        })
 
 
 if __name__ == "__main__":
