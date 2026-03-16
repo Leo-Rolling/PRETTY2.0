@@ -194,7 +194,9 @@ def scan_all_skus():
 
 def compute_shipping_plan(wh_key, velocity, stock, transit, plan):
     total_pipeline = stock + transit + plan
+    moving_pipeline = stock + transit
     days_left = round(stock / velocity, 1) if velocity > 0 else float("inf")
+    moving_stock = round(moving_pipeline / velocity, 1) if velocity > 0 else float("inf")
     duration = round(total_pipeline / velocity, 1) if velocity > 0 else float("inf")
 
     methods = []
@@ -219,7 +221,7 @@ def compute_shipping_plan(wh_key, velocity, stock, transit, plan):
     return {
         "stock": stock, "transit": transit, "plan": plan,
         "total_pipeline": total_pipeline, "days_left": days_left,
-        "duration": duration, "methods": methods,
+        "moving_stock": moving_stock, "duration": duration, "methods": methods,
     }
 
 
@@ -282,6 +284,7 @@ def fetch_shipment_plan(wh_key):
                     "velocity": velocity,
                     "sales_90d": total_sales,
                     "duration": sp["duration"],
+                    "moving_stock": sp["moving_stock"],
                     "days_left": sp["days_left"],
                     "units_needed": m["units_needed"],
                     "days_to_act": m["days_to_act"],
@@ -449,7 +452,20 @@ SKU_TEMPLATE = """
         .metric.stock .val { color: #10b981; }
         .metric.transit .val { color: #60a5fa; }
         .metric.plan .val { color: #a78bfa; }
-        .duration-row { display: flex; justify-content: space-between; background: #0f1117; border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; }
+        .summary-box { background: #1a1d27; border-radius: 10px; padding: 18px; margin-bottom: 20px; border: 1px solid #2d3040; }
+        .summary-box h3 { color: #fff; font-size: 14px; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 1px; }
+        .summary-metrics { display: grid; grid-template-columns: repeat(8, 1fr); gap: 10px; }
+        @media (max-width: 1200px) { .summary-metrics { grid-template-columns: repeat(4, 1fr); } }
+        @media (max-width: 700px) { .summary-metrics { grid-template-columns: repeat(2, 1fr); } }
+        .summary-metric { background: #0f1117; border-radius: 6px; padding: 12px 8px; text-align: center; }
+        .summary-metric .s-val { font-size: 20px; font-weight: 700; color: #fff; }
+        .summary-metric .s-lbl { font-size: 10px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
+        .summary-metric.s-stock .s-val { color: #10b981; }
+        .summary-metric.s-transit .s-val { color: #60a5fa; }
+        .summary-metric.s-plan .s-val { color: #a78bfa; }
+
+        .duration-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; background: #0f1117; border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; }
+        .duration-row > div { text-align: center; }
         .duration-row .dur-label { font-size: 11px; color: #6b7280; }
         .duration-row .dur-val { font-size: 16px; font-weight: 700; }
         .dur-ok { color: #10b981; }
@@ -503,6 +519,37 @@ SKU_TEMPLATE = """
             <div class="name">{{ product_name }}</div>
             <div class="asin">{{ selected_asin }} &middot; {{ sku }}</div>
         </div>
+
+        {% set tot_stock = data["EU"].stock + data["UK"].stock + data["US"].stock + data["CA"].stock %}
+        {% set tot_transit = data["EU"].transit + data["UK"].transit + data["US"].transit + data["CA"].transit %}
+        {% set tot_plan = data["EU"].plan + data["UK"].plan + data["US"].plan + data["CA"].plan %}
+        {% set tot_vel = data["EU"].velocity + data["UK"].velocity + data["US"].velocity + data["CA"].velocity %}
+        <div class="summary-box">
+            <h3>All Warehouses Summary</h3>
+            <div class="summary-metrics">
+                <div class="summary-metric s-stock"><div class="s-val">{{ tot_stock }}</div><div class="s-lbl">Stock</div></div>
+                <div class="summary-metric s-transit"><div class="s-val">{{ tot_transit }}</div><div class="s-lbl">Transit</div></div>
+                <div class="summary-metric s-plan"><div class="s-val">{{ tot_plan }}</div><div class="s-lbl">Plan</div></div>
+                <div class="summary-metric"><div class="s-val">{{ tot_vel }}<small style="font-size:11px;color:#6b7280">/d</small></div><div class="s-lbl">Velocity</div></div>
+                <div class="summary-metric">
+                    <div class="s-val {% if tot_vel > 0 %}{% if (tot_stock / tot_vel)|round(1) >= 90 %}dur-ok{% elif (tot_stock / tot_vel)|round(1) >= 45 %}dur-warn{% else %}dur-danger{% endif %}{% else %}dur-inf{% endif %}">
+                        {% if tot_vel > 0 %}{{ (tot_stock / tot_vel)|round(1) }}d{% else %}&infin;{% endif %}
+                    </div><div class="s-lbl">Real Stock</div>
+                </div>
+                <div class="summary-metric">
+                    <div class="s-val {% if tot_vel > 0 %}{% if ((tot_stock + tot_transit) / tot_vel)|round(1) >= 90 %}dur-ok{% elif ((tot_stock + tot_transit) / tot_vel)|round(1) >= 45 %}dur-warn{% else %}dur-danger{% endif %}{% else %}dur-inf{% endif %}">
+                        {% if tot_vel > 0 %}{{ ((tot_stock + tot_transit) / tot_vel)|round(1) }}d{% else %}&infin;{% endif %}
+                    </div><div class="s-lbl">Moving Stock</div>
+                </div>
+                <div class="summary-metric">
+                    <div class="s-val {% if tot_vel > 0 %}{% if ((tot_stock + tot_transit + tot_plan) / tot_vel)|round(1) >= 90 %}dur-ok{% elif ((tot_stock + tot_transit + tot_plan) / tot_vel)|round(1) >= 45 %}dur-warn{% else %}dur-danger{% endif %}{% else %}dur-inf{% endif %}">
+                        {% if tot_vel > 0 %}{{ ((tot_stock + tot_transit + tot_plan) / tot_vel)|round(1) }}d{% else %}&infin;{% endif %}
+                    </div><div class="s-lbl">Total Stock</div>
+                </div>
+                <div class="summary-metric"><div class="s-val">{{ tot_stock + tot_transit + tot_plan }}</div><div class="s-lbl">Pipeline</div></div>
+            </div>
+        </div>
+
         <div class="grid">
             {% for wh_key in ["EU", "UK", "US", "CA"] %}
             {% set wh = data[wh_key] %}
@@ -518,15 +565,21 @@ SKU_TEMPLATE = """
                 </div>
                 <div class="duration-row">
                     <div>
-                        <div class="dur-label">Duration</div>
-                        <div class="dur-val {% if wh.duration == 'inf' %}dur-inf{% elif wh.duration >= 90 %}dur-ok{% elif wh.duration >= 45 %}dur-warn{% else %}dur-danger{% endif %}">
-                            {% if wh.duration == 'inf' %}&infin;{% else %}{{ wh.duration }}d{% endif %}
-                        </div>
-                    </div>
-                    <div style="text-align:right;">
-                        <div class="dur-label">Days Left</div>
+                        <div class="dur-label">Real Stock</div>
                         <div class="dur-val {% if wh.days_left == 'inf' %}dur-inf{% elif wh.days_left >= 90 %}dur-ok{% elif wh.days_left >= 45 %}dur-warn{% else %}dur-danger{% endif %}">
                             {% if wh.days_left == 'inf' %}&infin;{% else %}{{ wh.days_left }}d{% endif %}
+                        </div>
+                    </div>
+                    <div>
+                        <div class="dur-label">Moving Stock</div>
+                        <div class="dur-val {% if wh.moving_stock == 'inf' %}dur-inf{% elif wh.moving_stock >= 90 %}dur-ok{% elif wh.moving_stock >= 45 %}dur-warn{% else %}dur-danger{% endif %}">
+                            {% if wh.moving_stock == 'inf' %}&infin;{% else %}{{ wh.moving_stock }}d{% endif %}
+                        </div>
+                    </div>
+                    <div>
+                        <div class="dur-label">Total Stock</div>
+                        <div class="dur-val {% if wh.duration == 'inf' %}dur-inf{% elif wh.duration >= 90 %}dur-ok{% elif wh.duration >= 45 %}dur-warn{% else %}dur-danger{% endif %}">
+                            {% if wh.duration == 'inf' %}&infin;{% else %}{{ wh.duration }}d{% endif %}
                         </div>
                     </div>
                 </div>
@@ -686,8 +739,9 @@ SHIPMENT_TEMPLATE = """
                     <th>Transit</th>
                     <th>Plan</th>
                     <th>Velocity</th>
-                    <th>Duration</th>
-                    <th>Days Left</th>
+                    <th>Real Stock</th>
+                    <th>Moving Stock</th>
+                    <th>Total Stock</th>
                     <th>Units to Send</th>
                     <th>Action</th>
                 </tr>
@@ -702,8 +756,9 @@ SHIPMENT_TEMPLATE = """
                     <td class="num-blue">{{ r.transit }}</td>
                     <td class="num-purple">{{ r.plan }}</td>
                     <td class="num-yellow">{{ r.velocity }}/d</td>
-                    <td>{% if r.duration == 'inf' %}&infin;{% else %}{{ r.duration }}d{% endif %}</td>
                     <td>{% if r.days_left == 'inf' %}&infin;{% else %}{{ r.days_left }}d{% endif %}</td>
+                    <td>{% if r.moving_stock == 'inf' %}&infin;{% else %}{{ r.moving_stock }}d{% endif %}</td>
+                    <td>{% if r.duration == 'inf' %}&infin;{% else %}{{ r.duration }}d{% endif %}</td>
                     <td class="units-cell">{{ r.units_needed }}</td>
                     <td>
                         {% if r.urgent %}
@@ -751,6 +806,8 @@ def _convert_inf(data):
             wh["duration"] = "inf"
         if wh["days_left"] == float("inf"):
             wh["days_left"] = "inf"
+        if wh["moving_stock"] == float("inf"):
+            wh["moving_stock"] = "inf"
         for m in wh["methods"]:
             if m["days_to_act"] == float("inf"):
                 m["days_to_act"] = "inf"
@@ -832,6 +889,8 @@ def shipments():
             for r in shipments_data[method]:
                 if r["duration"] == float("inf"):
                     r["duration"] = "inf"
+                if r["moving_stock"] == float("inf"):
+                    r["moving_stock"] = "inf"
                 if r["days_left"] == float("inf"):
                     r["days_left"] = "inf"
                 if r["days_to_act"] == float("inf"):
