@@ -885,10 +885,14 @@ def dashboard():
             data = _convert_inf(data)
         else:
             # ASIN not in cache yet (or force refresh) — fetch live
-            data, product_name, sku = fetch_data_for_asin(selected_asin)
-            with _cache_lock:
-                DATA_CACHE["sku_data"][selected_asin] = (data, product_name, sku)
-            data = _convert_inf(data)
+            try:
+                data, product_name, sku = fetch_data_for_asin(selected_asin)
+                with _cache_lock:
+                    DATA_CACHE["sku_data"][selected_asin] = (data, product_name, sku)
+                data = _convert_inf(data)
+            except Exception as e:
+                print(f"[SKU] Error fetching {selected_asin}: {e}")
+                data = None
 
     wh_labels = {k: v["label"] for k, v in WAREHOUSES.items()}
     if last_refresh:
@@ -924,22 +928,27 @@ def shipments():
             shipments_data = copy.deepcopy(cached)
         else:
             # Not cached yet (or force refresh) — fetch live
-            shipments_data = fetch_shipment_plan(selected_wh)
-            with _cache_lock:
-                DATA_CACHE["shipment_plans"][selected_wh] = shipments_data
-            shipments_data = copy.deepcopy(shipments_data)
+            try:
+                shipments_data = fetch_shipment_plan(selected_wh)
+                with _cache_lock:
+                    DATA_CACHE["shipment_plans"][selected_wh] = shipments_data
+                shipments_data = copy.deepcopy(shipments_data)
+            except Exception as e:
+                print(f"[Shipments] Error fetching {selected_wh}: {e}")
+                shipments_data = None
 
         # Convert inf for template
-        for method in shipments_data:
-            for r in shipments_data[method]:
-                if r["duration"] == float("inf"):
-                    r["duration"] = "inf"
-                if r["moving_stock"] == float("inf"):
-                    r["moving_stock"] = "inf"
-                if r["days_left"] == float("inf"):
-                    r["days_left"] = "inf"
-                if r["days_to_act"] == float("inf"):
-                    r["days_to_act"] = "inf"
+        if shipments_data:
+            for method in shipments_data:
+                for r in shipments_data[method]:
+                    if r["duration"] == float("inf"):
+                        r["duration"] = "inf"
+                    if r["moving_stock"] == float("inf"):
+                        r["moving_stock"] = "inf"
+                    if r["days_left"] == float("inf"):
+                        r["days_left"] = "inf"
+                    if r["days_to_act"] == float("inf"):
+                        r["days_to_act"] = "inf"
 
     with _cache_lock:
         last_refresh = DATA_CACHE["last_refresh"]
@@ -1168,7 +1177,15 @@ def preview_alert():
     return html
 
 
-_start_daily_alert()
+_daily_alert_started = False
+
+@app.before_request
+def _maybe_start_daily_alert():
+    global _daily_alert_started
+    if not _daily_alert_started:
+        _daily_alert_started = True
+        _start_daily_alert()
+
 
 if __name__ == "__main__":
     print("Starting PRETTY 2.0 Dashboard on http://127.0.0.1:8080")
