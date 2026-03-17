@@ -20,7 +20,7 @@ CACHE_REFRESH_MINUTES = 10
 
 # ── Email config (Resend) ─────────────────────────────────────────────
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
-ALERT_RECIPIENTS = ["leonardo@rollingsquare.com", "lorenzo@rollingsquare.com", "andrea@rollingsquare.com"]
+ALERT_RECIPIENTS = ["leonardo@rollingsquare.com"]
 
 SHIPPING = {
     "AIR":   {"lead_days": 10, "min_duration": {"EU": 30, "UK": 30, "US": 30, "CA": 30}},
