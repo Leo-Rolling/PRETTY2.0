@@ -386,6 +386,21 @@ def _ensure_cache():
     thread.start()
 
 
+def _keep_alive_loop():
+    """Self-ping to prevent Render free tier from sleeping the service."""
+    import urllib.request
+    # Wait for PORT env to be set (Render sets it)
+    port = os.getenv("PORT", "8080")
+    url = f"http://127.0.0.1:{port}/health"
+    while True:
+        time.sleep(10 * 60)  # every 10 minutes
+        try:
+            urllib.request.urlopen(url, timeout=10)
+            print("[KeepAlive] Self-ping OK")
+        except Exception as e:
+            print(f"[KeepAlive] Self-ping failed: {e}")
+
+
 # ── Daily alert scheduler ─────────────────────────────────────────────
 _daily_alert_sent_date = None
 
@@ -1159,14 +1174,24 @@ def preview_alert():
     return html
 
 
-_daily_alert_started = False
+_startup_done = False
 
 @app.before_request
-def _maybe_start_daily_alert():
-    global _daily_alert_started
-    if not _daily_alert_started:
-        _daily_alert_started = True
+def _maybe_start_background():
+    global _startup_done
+    if not _startup_done:
+        _startup_done = True
         _start_daily_alert()
+        # Start keep-alive self-ping (prevents Render free tier sleep)
+        threading.Thread(target=_keep_alive_loop, daemon=True).start()
+        print("[Startup] Daily alert + keep-alive threads started")
+
+
+# ── Eager cache: start loading data immediately at boot ──────────────
+# This runs when gunicorn imports the module, so data starts loading
+# before any user request arrives (saves 5-10 min wait on first visit)
+threading.Thread(target=_refresh_cache, daemon=True).start()
+print("[Boot] Cache refresh started eagerly at import time")
 
 
 @app.errorhandler(Exception)
@@ -1187,7 +1212,7 @@ def health():
             "last_refresh": DATA_CACHE["last_refresh"].strftime("%Y-%m-%d %H:%M UTC") if DATA_CACHE["last_refresh"] else None,
             "cached_asins": len(DATA_CACHE["sku_data"]),
             "cached_shipment_plans": list(DATA_CACHE["shipment_plans"].keys()),
-            "daily_alert_started": _daily_alert_started,
+            "startup_done": _startup_done,
         }
     return jsonify(info)
 
