@@ -332,12 +332,27 @@ def _refresh_cache():
         print("[Cache] Starting full refresh...")
         start = time.time()
 
-        # 1) Scan all SKUs
+        # 1) Scan all SKUs (fast — just inventory listings)
         skus = scan_all_skus()
         with _cache_lock:
             DATA_CACHE["skus"] = skus
+        print(f"[Cache] SKU scan done: {len(skus)} ASINs found")
 
-        # 2) Fetch data for each ASIN
+        # 2) Fetch shipment plans FIRST — this is the most-used view
+        #    Each warehouse does bulk inventory + sales, much faster than per-ASIN
+        for wh_key in WAREHOUSES:
+            try:
+                print(f"[Cache] Fetching shipment plan for {wh_key}...")
+                plan = fetch_shipment_plan(wh_key)
+                with _cache_lock:
+                    DATA_CACHE["shipment_plans"][wh_key] = plan
+                print(f"[Cache] Shipment plan {wh_key} ready")
+            except Exception as e:
+                print(f"[Cache] Error fetching shipment plan {wh_key}: {e}")
+
+        print(f"[Cache] All shipment plans ready in {round(time.time() - start, 1)}s")
+
+        # 3) Fetch per-ASIN detailed data (SKU View) — slower, runs after
         for asin in list(skus.keys()):
             try:
                 data, product_name, sku = fetch_data_for_asin(asin)
@@ -345,15 +360,6 @@ def _refresh_cache():
                     DATA_CACHE["sku_data"][asin] = (data, product_name, sku)
             except Exception as e:
                 print(f"[Cache] Error fetching ASIN {asin}: {e}")
-
-        # 3) Fetch shipment plans for each warehouse
-        for wh_key in WAREHOUSES:
-            try:
-                plan = fetch_shipment_plan(wh_key)
-                with _cache_lock:
-                    DATA_CACHE["shipment_plans"][wh_key] = plan
-            except Exception as e:
-                print(f"[Cache] Error fetching shipment plan {wh_key}: {e}")
 
         elapsed = round(time.time() - start, 1)
         with _cache_lock:
@@ -841,6 +847,11 @@ SHIPMENT_TEMPLATE = """
     {% endif %}
     {% endfor %}
 
+    {% elif selected_wh and not shipments %}
+    <div class="loading">
+        <span class="spinner"></span>
+        Loading {{ wh_labels[selected_wh] }} shipment data... This page will auto-refresh.
+    </div>
     {% else %}
     <div class="no-data">Select a warehouse above to see all ASINs that need replenishment, grouped by shipping channel.</div>
     {% endif %}
@@ -851,6 +862,12 @@ SHIPMENT_TEMPLATE = """
         &middot; Auto-refresh every {{ cache_minutes }}min
         &middot; <a href="#" onclick="fetch('/refresh').then(r=>r.json()).then(d=>alert(d.status==='already refreshing'?'Already refreshing...':'Refresh started!'))" style="color:#3b82f6;text-decoration:none;">Refresh Now</a>
     </div>
+    {% if selected_wh and not shipments %}
+    <script>
+        // Auto-refresh every 15 seconds while waiting for data
+        setTimeout(function(){ window.location.reload(); }, 15000);
+    </script>
+    {% endif %}
 </body>
 </html>
 """
