@@ -937,8 +937,7 @@ def shipments():
     try:
         _ensure_cache()
 
-        selected_wh = request.args.get("wh", "")
-        force = request.args.get("force", "")
+        selected_wh = request.args.get("wh", "EU")  # Default to EU
         wh_labels = {k: v["label"] for k, v in WAREHOUSES.items()}
         shipments_data = None
 
