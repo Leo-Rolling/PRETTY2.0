@@ -3,6 +3,7 @@ import json
 import time
 import copy
 import threading
+import traceback
 import resend
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -901,48 +902,53 @@ def dashboard():
 
 @app.route("/shipments")
 def shipments():
-    _ensure_cache()
+    try:
+        _ensure_cache()
 
-    selected_wh = request.args.get("wh", "")
-    force = request.args.get("force", "")
-    wh_labels = {k: v["label"] for k, v in WAREHOUSES.items()}
-    shipments_data = None
+        selected_wh = request.args.get("wh", "")
+        force = request.args.get("force", "")
+        wh_labels = {k: v["label"] for k, v in WAREHOUSES.items()}
+        shipments_data = None
 
-    if selected_wh and selected_wh in WAREHOUSES:
+        if selected_wh and selected_wh in WAREHOUSES:
+            with _cache_lock:
+                cached = DATA_CACHE["shipment_plans"].get(selected_wh)
+
+            if cached:
+                shipments_data = copy.deepcopy(cached)
+                # Convert inf for template
+                for method in shipments_data:
+                    for r in shipments_data[method]:
+                        if r["duration"] == float("inf"):
+                            r["duration"] = "inf"
+                        if r["moving_stock"] == float("inf"):
+                            r["moving_stock"] = "inf"
+                        if r["days_left"] == float("inf"):
+                            r["days_left"] = "inf"
+                        if r["days_to_act"] == float("inf"):
+                            r["days_to_act"] = "inf"
+
         with _cache_lock:
-            cached = DATA_CACHE["shipment_plans"].get(selected_wh)
+            last_refresh = DATA_CACHE["last_refresh"]
+            refreshing = DATA_CACHE["refreshing"]
 
-        if cached:
-            shipments_data = copy.deepcopy(cached)
-            # Convert inf for template
-            for method in shipments_data:
-                for r in shipments_data[method]:
-                    if r["duration"] == float("inf"):
-                        r["duration"] = "inf"
-                    if r["moving_stock"] == float("inf"):
-                        r["moving_stock"] = "inf"
-                    if r["days_left"] == float("inf"):
-                        r["days_left"] = "inf"
-                    if r["days_to_act"] == float("inf"):
-                        r["days_to_act"] = "inf"
+        if last_refresh:
+            ts = last_refresh.strftime("%Y-%m-%d %H:%M UTC")
+        else:
+            ts = "Loading first data..." if refreshing else "No data yet"
 
-    with _cache_lock:
-        last_refresh = DATA_CACHE["last_refresh"]
-        refreshing = DATA_CACHE["refreshing"]
-
-    if last_refresh:
-        ts = last_refresh.strftime("%Y-%m-%d %H:%M UTC")
-    else:
-        ts = "Loading first data..." if refreshing else "No data yet"
-
-    return render_template_string(
-        SHIPMENT_TEMPLATE,
-        page="shipments",
-        selected_wh=selected_wh,
-        shipments=shipments_data,
-        wh_labels=wh_labels,
-        timestamp=ts, refreshing=refreshing, cache_minutes=CACHE_REFRESH_MINUTES,
-    )
+        return render_template_string(
+            SHIPMENT_TEMPLATE,
+            page="shipments",
+            selected_wh=selected_wh,
+            shipments=shipments_data,
+            wh_labels=wh_labels,
+            timestamp=ts, refreshing=refreshing, cache_minutes=CACHE_REFRESH_MINUTES,
+        )
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[SHIPMENTS ERROR] {e}\n{tb}")
+        return f"<pre style='background:#111;color:#f66;padding:20px;'>{tb}</pre>", 500
 
 
 @app.route("/refresh")
@@ -1161,6 +1167,29 @@ def _maybe_start_daily_alert():
     if not _daily_alert_started:
         _daily_alert_started = True
         _start_daily_alert()
+
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    """Show real error instead of generic 500 — helps debug on Render."""
+    tb = traceback.format_exc()
+    print(f"[ERROR] {e}\n{tb}")
+    return f"<pre style='background:#111;color:#f66;padding:20px;font-size:13px;'>{tb}</pre>", 500
+
+
+@app.route("/health")
+def health():
+    """Health check with diagnostic info."""
+    with _cache_lock:
+        info = {
+            "status": "ok",
+            "refreshing": DATA_CACHE["refreshing"],
+            "last_refresh": DATA_CACHE["last_refresh"].strftime("%Y-%m-%d %H:%M UTC") if DATA_CACHE["last_refresh"] else None,
+            "cached_asins": len(DATA_CACHE["sku_data"]),
+            "cached_shipment_plans": list(DATA_CACHE["shipment_plans"].keys()),
+            "daily_alert_started": _daily_alert_started,
+        }
+    return jsonify(info)
 
 
 if __name__ == "__main__":
