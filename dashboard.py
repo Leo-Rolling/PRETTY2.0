@@ -5,6 +5,7 @@ import copy
 import threading
 import resend
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from flask import Flask, render_template_string, request, jsonify
 from dotenv import load_dotenv
 from sp_api.api import Inventories, Sales
@@ -21,6 +22,8 @@ CACHE_REFRESH_MINUTES = 10
 # ── Email config (Resend) ─────────────────────────────────────────────
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 ALERT_RECIPIENTS = ["leonardo@rollingsquare.com"]
+DAILY_ALERT_HOUR = 9   # 9:00 AM
+DAILY_ALERT_TZ = ZoneInfo("Europe/Rome")
 
 SHIPPING = {
     "AIR":   {"lead_days": 10, "min_duration": {"EU": 30, "UK": 30, "US": 30, "CA": 30}},
@@ -382,6 +385,33 @@ def _ensure_cache():
     thread.start()
 
 
+# ── Daily alert scheduler ─────────────────────────────────────────────
+_daily_alert_sent_date = None
+
+def _daily_alert_loop():
+    """Background loop that sends the alert email every day at 9:00 AM Rome time."""
+    global _daily_alert_sent_date
+    while True:
+        now_rome = datetime.now(DAILY_ALERT_TZ)
+        today = now_rome.date()
+        if now_rome.hour == DAILY_ALERT_HOUR and _daily_alert_sent_date != today:
+            # Ensure cache has data before sending
+            with _cache_lock:
+                has_data = DATA_CACHE["last_refresh"] is not None
+            if has_data:
+                print(f"[DailyAlert] Sending scheduled alert at {now_rome.strftime('%H:%M %Z')}")
+                result = _send_alert_email()
+                print(f"[DailyAlert] {result}")
+                _daily_alert_sent_date = today
+        time.sleep(30)  # Check every 30 seconds
+
+
+def _start_daily_alert():
+    t = threading.Thread(target=_daily_alert_loop, daemon=True)
+    t.start()
+    print(f"[DailyAlert] Scheduler started — alert at {DAILY_ALERT_HOUR}:00 Europe/Rome daily")
+
+
 # ── shared CSS + nav ─────────────────────────────────────────────────
 
 SHARED_CSS = """
@@ -545,7 +575,7 @@ SKU_TEMPLATE = """
                 <div class="summary-metric s-stock"><div class="s-val">{{ tot_stock }}</div><div class="s-lbl">Stock</div></div>
                 <div class="summary-metric s-transit"><div class="s-val">{{ tot_transit }}</div><div class="s-lbl">Transit</div></div>
                 <div class="summary-metric s-plan"><div class="s-val">{{ tot_plan }}</div><div class="s-lbl">Plan</div></div>
-                <div class="summary-metric"><div class="s-val">{{ tot_vel }}<small style="font-size:11px;color:#6b7280">/d</small></div><div class="s-lbl">Velocity</div></div>
+                <div class="summary-metric"><div class="s-val">{{ tot_vel|round(2) }}<small style="font-size:11px;color:#6b7280">/d</small></div><div class="s-lbl">Velocity</div></div>
                 <div class="summary-metric">
                     <div class="s-val {% if tot_vel > 0 %}{% if (tot_stock / tot_vel)|round(1) >= 90 %}dur-ok{% elif (tot_stock / tot_vel)|round(1) >= 45 %}dur-warn{% else %}dur-danger{% endif %}{% else %}dur-inf{% endif %}">
                         {% if tot_vel > 0 %}{{ (tot_stock / tot_vel)|round(1) }}d{% else %}&infin;{% endif %}
@@ -571,7 +601,7 @@ SKU_TEMPLATE = """
             <div class="wh-card wh-{{ wh_key }}">
                 <div class="wh-header">
                     <div class="wh-name">{{ wh_labels[wh_key] }}</div>
-                    <div class="wh-vel">{{ wh.velocity }} <small>units/day</small></div>
+                    <div class="wh-vel">{{ wh.velocity|round(2) }} <small>units/day</small></div>
                 </div>
                 <div class="metrics">
                     <div class="metric stock"><div class="val">{{ wh.stock }}</div><div class="lbl">Stock</div></div>
@@ -770,7 +800,7 @@ SHIPMENT_TEMPLATE = """
                     <td class="num-green">{{ r.stock }}</td>
                     <td class="num-blue">{{ r.transit }}</td>
                     <td class="num-purple">{{ r.plan }}</td>
-                    <td class="num-yellow">{{ r.velocity }}/d</td>
+                    <td class="num-yellow">{{ r.velocity|round(2) }}/d</td>
                     <td>{% if r.days_left == 'inf' %}&infin;{% else %}{{ r.days_left }}d{% endif %}</td>
                     <td>{% if r.moving_stock == 'inf' %}&infin;{% else %}{{ r.moving_stock }}d{% endif %}</td>
                     <td>{% if r.duration == 'inf' %}&infin;{% else %}{{ r.duration }}d{% endif %}</td>
@@ -1068,7 +1098,7 @@ def _build_alert_html():
                 <td style="text-align:left;font-weight:600;">{a['sku']}</td>
                 <td style="color:#6b7280;font-family:monospace;font-size:11px;">{a['asin']}</td>
                 <td style="color:#10b981;font-weight:600;">{a['stock']}</td>
-                <td style="color:#f59e0b;font-weight:600;">{a['velocity']}/d</td>
+                <td style="color:#f59e0b;font-weight:600;">{round(a['velocity'], 2)}/d</td>
                 <td>{dl}</td>
                 <td><span class="{method_class}">{a['method']}</span></td>
                 <td style="font-size:15px;font-weight:700;">{a['units']}</td>
@@ -1137,6 +1167,8 @@ def preview_alert():
         return "No items need replenishment — nothing to show.", 200
     return html
 
+
+_start_daily_alert()
 
 if __name__ == "__main__":
     print("Starting PRETTY 2.0 Dashboard on http://127.0.0.1:8080")
