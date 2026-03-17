@@ -879,20 +879,9 @@ def dashboard():
         with _cache_lock:
             cached = DATA_CACHE["sku_data"].get(selected_asin)
 
-        if cached and not force:
-            # Serve from cache — instant!
+        if cached:
             data, product_name, sku = cached
             data = _convert_inf(data)
-        else:
-            # ASIN not in cache yet (or force refresh) — fetch live
-            try:
-                data, product_name, sku = fetch_data_for_asin(selected_asin)
-                with _cache_lock:
-                    DATA_CACHE["sku_data"][selected_asin] = (data, product_name, sku)
-                data = _convert_inf(data)
-            except Exception as e:
-                print(f"[SKU] Error fetching {selected_asin}: {e}")
-                data = None
 
     wh_labels = {k: v["label"] for k, v in WAREHOUSES.items()}
     if last_refresh:
@@ -923,22 +912,9 @@ def shipments():
         with _cache_lock:
             cached = DATA_CACHE["shipment_plans"].get(selected_wh)
 
-        if cached and not force:
-            # Serve from cache — instant!
+        if cached:
             shipments_data = copy.deepcopy(cached)
-        else:
-            # Not cached yet (or force refresh) — fetch live
-            try:
-                shipments_data = fetch_shipment_plan(selected_wh)
-                with _cache_lock:
-                    DATA_CACHE["shipment_plans"][selected_wh] = shipments_data
-                shipments_data = copy.deepcopy(shipments_data)
-            except Exception as e:
-                print(f"[Shipments] Error fetching {selected_wh}: {e}")
-                shipments_data = None
-
-        # Convert inf for template
-        if shipments_data:
+            # Convert inf for template
             for method in shipments_data:
                 for r in shipments_data[method]:
                     if r["duration"] == float("inf"):
