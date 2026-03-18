@@ -5,6 +5,7 @@ import copy
 import threading
 import traceback
 import resend
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, render_template_string, request, jsonify
@@ -167,8 +168,8 @@ def get_sales_90d(credentials, marketplace, asin):
         )
         if resp.payload:
             return resp.payload[0].get("unitCount", 0)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  Sales error {marketplace.name}/{asin}: {e}")
     return 0
 
 
@@ -264,16 +265,40 @@ def fetch_data_for_asin(asin):
     return result, product_name, sku
 
 
+def _get_total_sales_for_asin(credentials, sales_marketplaces, asin):
+    """Get total 90-day sales for one ASIN across all marketplaces."""
+    total = 0
+    for mp_key, mp_val in sales_marketplaces.items():
+        total += get_sales_90d(credentials, mp_val, asin)
+    return asin, total
+
+
 def fetch_shipment_plan(wh_key):
     """Fetch ALL ASINs for a warehouse, compute replenishment, group by shipping method."""
     wh = WAREHOUSES[wh_key]
     all_inv = get_all_inventory(wh["credentials"], wh["inv_marketplace"], wh["inv_granularity_id"])
+    print(f"  [{wh_key}] Got {len(all_inv)} ASINs inventory, fetching sales in parallel...")
+
+    # Fetch sales for all ASINs in parallel (4 threads to avoid heavy throttling)
+    sales_map = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {
+            pool.submit(_get_total_sales_for_asin, wh["credentials"], wh["sales_marketplaces"], asin): asin
+            for asin in all_inv
+        }
+        done = 0
+        for future in as_completed(futures):
+            asin, total_sales = future.result()
+            sales_map[asin] = total_sales
+            done += 1
+            if done % 10 == 0:
+                print(f"  [{wh_key}] Sales fetched: {done}/{len(all_inv)}")
+
+    print(f"  [{wh_key}] All sales fetched, computing shipment plan...")
 
     shipments = {"AIR": [], "TRUCK": [], "SEA": []}
     for asin, inv in all_inv.items():
-        total_sales = 0
-        for mp_key, mp_val in wh["sales_marketplaces"].items():
-            total_sales += get_sales_90d(wh["credentials"], mp_val, asin)
+        total_sales = sales_map.get(asin, 0)
         velocity = round(total_sales / 90, 2)
         stock = inv["fulfillable"]
         transit = inv["inbound_shipped"] + inv["inbound_receiving"]
