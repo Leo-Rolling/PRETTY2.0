@@ -5,7 +5,6 @@ import copy
 import threading
 import traceback
 import resend
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, render_template_string, request, jsonify
@@ -19,7 +18,7 @@ load_dotenv()
 app = Flask(__name__)
 
 SAFETY_STOCK_DAYS = 90
-CACHE_REFRESH_MINUTES = 10
+CACHE_REFRESH_MINUTES = 60
 
 # ── Email config (Resend) ─────────────────────────────────────────────
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
@@ -54,6 +53,7 @@ WAREHOUSES = {
             "ES": Marketplaces.ES, "NL": Marketplaces.NL, "PL": Marketplaces.PL,
             "SE": Marketplaces.SE, "BE": Marketplaces.BE,
         },
+        "primary_sales_marketplace": Marketplaces.DE,
         "label": "AMZ EU",
         "color": "#3b82f6",
     },
@@ -62,6 +62,7 @@ WAREHOUSES = {
         "inv_marketplace": Marketplaces.GB,
         "inv_granularity_id": "A1F83G8C2ARO7P",
         "sales_marketplaces": {"UK": Marketplaces.GB},
+        "primary_sales_marketplace": Marketplaces.GB,
         "label": "AMZ UK",
         "color": "#8b5cf6",
     },
@@ -70,6 +71,7 @@ WAREHOUSES = {
         "inv_marketplace": Marketplaces.US,
         "inv_granularity_id": "ATVPDKIKX0DER",
         "sales_marketplaces": {"US": Marketplaces.US},
+        "primary_sales_marketplace": Marketplaces.US,
         "label": "AMZ US",
         "color": "#f59e0b",
     },
@@ -78,6 +80,7 @@ WAREHOUSES = {
         "inv_marketplace": Marketplaces.CA,
         "inv_granularity_id": "A2EUQ1WTGCTBG2",
         "sales_marketplaces": {"CA": Marketplaces.CA},
+        "primary_sales_marketplace": Marketplaces.CA,
         "label": "AMZ CA",
         "color": "#ef4444",
     },
@@ -241,12 +244,12 @@ def fetch_data_for_asin(asin):
     sku = ""
     for wh_key, wh in WAREHOUSES.items():
         inv = get_inventory(wh["credentials"], wh["inv_marketplace"], wh["inv_granularity_id"], asin)
-        total_sales = 0
-        mp_breakdown = {}
-        for mp_key, mp_val in wh["sales_marketplaces"].items():
-            units = get_sales_90d(wh["credentials"], mp_val, asin)
-            mp_breakdown[mp_key] = units
-            total_sales += units
+        # Use primary marketplace only, scale by number of marketplaces
+        primary_mp = wh["primary_sales_marketplace"]
+        num_mps = len(wh["sales_marketplaces"])
+        primary_sales = get_sales_90d(wh["credentials"], primary_mp, asin)
+        total_sales = primary_sales * num_mps
+        mp_breakdown = {list(wh["sales_marketplaces"].keys())[0]: primary_sales}
         velocity = round(total_sales / 90, 2)
         if inv:
             stock = inv["fulfillable"]
@@ -265,34 +268,23 @@ def fetch_data_for_asin(asin):
     return result, product_name, sku
 
 
-def _get_total_sales_for_asin(credentials, sales_marketplaces, asin):
-    """Get total 90-day sales for one ASIN across all marketplaces."""
-    total = 0
-    for mp_key, mp_val in sales_marketplaces.items():
-        total += get_sales_90d(credentials, mp_val, asin)
-    return asin, total
-
-
-def fetch_shipment_plan(wh_key):
-    """Fetch ALL ASINs for a warehouse, compute replenishment, group by shipping method."""
+def _compute_shipment_plan_from_inv(wh_key, all_inv):
+    """Compute shipment plan given pre-fetched inventory data.
+    Uses only the PRIMARY marketplace for sales velocity to keep API calls low.
+    EU: uses DE sales only (1 call/ASIN instead of 8), then scales up.
+    """
     wh = WAREHOUSES[wh_key]
-    all_inv = get_all_inventory(wh["credentials"], wh["inv_marketplace"], wh["inv_granularity_id"])
-    print(f"  [{wh_key}] Got {len(all_inv)} ASINs inventory, fetching sales in parallel...")
+    primary_mp = wh["primary_sales_marketplace"]
+    num_mps = len(wh["sales_marketplaces"])
 
-    # Fetch sales for all ASINs in parallel (4 threads to avoid heavy throttling)
     sales_map = {}
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {
-            pool.submit(_get_total_sales_for_asin, wh["credentials"], wh["sales_marketplaces"], asin): asin
-            for asin in all_inv
-        }
-        done = 0
-        for future in as_completed(futures):
-            asin, total_sales = future.result()
-            sales_map[asin] = total_sales
-            done += 1
-            if done % 10 == 0:
-                print(f"  [{wh_key}] Sales fetched: {done}/{len(all_inv)}")
+    done = 0
+    for asin in all_inv:
+        primary_sales = get_sales_90d(wh["credentials"], primary_mp, asin)
+        sales_map[asin] = primary_sales * num_mps
+        done += 1
+        if done % 10 == 0:
+            print(f"  [{wh_key}] Sales fetched: {done}/{len(all_inv)}")
 
     print(f"  [{wh_key}] All sales fetched, computing shipment plan...")
 
@@ -347,7 +339,13 @@ _cache_lock = threading.Lock()
 
 
 def _refresh_cache():
-    """Background task: refresh all data from Amazon APIs."""
+    """Background task: refresh all data from Amazon APIs.
+
+    Flow:
+    1) Get inventory for each warehouse (populates SKU list + feeds shipment plans)
+    2) Compute shipment plans using primary marketplace sales only
+    3) Fetch per-ASIN detailed data for SKU View (lower priority)
+    """
     with _cache_lock:
         if DATA_CACHE["refreshing"]:
             return
@@ -357,28 +355,47 @@ def _refresh_cache():
         print("[Cache] Starting full refresh...")
         start = time.time()
 
-        # 1) Scan all SKUs (fast — just inventory listings)
-        skus = scan_all_skus()
-        with _cache_lock:
-            DATA_CACHE["skus"] = skus
-        print(f"[Cache] SKU scan done: {len(skus)} ASINs found")
+        # 1) Get inventory for all warehouses — builds SKU list AND reuses for shipment plans
+        all_skus = {}
+        wh_inventories = {}  # {wh_key: {asin: inv_data}}
+        for wh_key, wh in WAREHOUSES.items():
+            try:
+                print(f"[Cache] Getting inventory for {wh_key}...")
+                inv = get_all_inventory(wh["credentials"], wh["inv_marketplace"], wh["inv_granularity_id"])
+                wh_inventories[wh_key] = inv
+                for asin, item in inv.items():
+                    if asin not in all_skus:
+                        all_skus[asin] = {"asin": asin, "sku": item["sku"], "name": item["product_name"][:80]}
+                print(f"[Cache] {wh_key} inventory: {len(inv)} ASINs")
+            except Exception as e:
+                print(f"[Cache] Error getting {wh_key} inventory: {e}")
+                wh_inventories[wh_key] = {}
+            time.sleep(1)
 
-        # 2) Fetch shipment plans FIRST — this is the most-used view
-        #    Each warehouse does bulk inventory + sales, much faster than per-ASIN
+        with _cache_lock:
+            DATA_CACHE["skus"] = all_skus
+        print(f"[Cache] SKU list ready: {len(all_skus)} ASINs ({round(time.time() - start, 1)}s)")
+
+        # 2) Compute shipment plans — uses cached inventory, only needs sales API calls
         for wh_key in WAREHOUSES:
             try:
-                print(f"[Cache] Fetching shipment plan for {wh_key}...")
-                plan = fetch_shipment_plan(wh_key)
+                all_inv = wh_inventories.get(wh_key, {})
+                if not all_inv:
+                    continue
+                print(f"[Cache] Fetching sales for {wh_key} ({len(all_inv)} ASINs)...")
+                plan = _compute_shipment_plan_from_inv(wh_key, all_inv)
                 with _cache_lock:
                     DATA_CACHE["shipment_plans"][wh_key] = plan
                 print(f"[Cache] Shipment plan {wh_key} ready")
             except Exception as e:
-                print(f"[Cache] Error fetching shipment plan {wh_key}: {e}")
+                print(f"[Cache] Error computing shipment plan {wh_key}: {e}")
 
+        with _cache_lock:
+            DATA_CACHE["last_refresh"] = datetime.utcnow()
         print(f"[Cache] All shipment plans ready in {round(time.time() - start, 1)}s")
 
-        # 3) Fetch per-ASIN detailed data (SKU View) — slower, runs after
-        for asin in list(skus.keys()):
+        # 3) Fetch per-ASIN detailed data (SKU View) — lower priority, runs after
+        for asin in list(all_skus.keys()):
             try:
                 data, product_name, sku = fetch_data_for_asin(asin)
                 with _cache_lock:
@@ -390,10 +407,11 @@ def _refresh_cache():
         with _cache_lock:
             DATA_CACHE["last_refresh"] = datetime.utcnow()
             DATA_CACHE["refreshing"] = False
-        print(f"[Cache] Refresh complete in {elapsed}s — {len(skus)} ASINs cached")
+        print(f"[Cache] Refresh complete in {elapsed}s — {len(all_skus)} ASINs cached")
 
     except Exception as e:
         print(f"[Cache] Refresh failed: {e}")
+        traceback.print_exc()
         with _cache_lock:
             DATA_CACHE["refreshing"] = False
 
