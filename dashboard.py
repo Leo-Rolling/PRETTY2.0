@@ -43,6 +43,12 @@ NA_CREDENTIALS = {
     "lwa_client_secret": os.getenv("NA_LWA_CLIENT_SECRET"),
 }
 
+# ── MSP Warehouse (Mailship) ──────────────────────────────────────────
+MSP_LOGIN = os.getenv("MSP_LOGIN", "")
+MSP_PASSWORD = os.getenv("MSP_PASSWORD", "")
+MSP_WAREHOUSE_ID = os.getenv("MSP_WAREHOUSE_ID", "")
+MSP_API_BASE = "https://app.mailship.eu/api"
+
 WAREHOUSES = {
     "EU": {
         "credentials": EU_CREDENTIALS,
@@ -238,6 +244,91 @@ def compute_shipping_plan(wh_key, velocity, stock, transit, plan):
     }
 
 
+def get_msp_token():
+    """Authenticate with Mailship API and return a bearer token."""
+    import urllib.request as _req
+    import json as _json
+    payload = _json.dumps({"login": MSP_LOGIN, "password": MSP_PASSWORD}).encode()
+    r = _req.Request(f"{MSP_API_BASE}/login/user", data=payload,
+                     headers={"Content-Type": "application/json"}, method="POST")
+    with _req.urlopen(r, timeout=15) as resp:
+        data = _json.loads(resp.read())
+    return data["token"]
+
+
+def get_msp_inventory():
+    """Fetch all MSP products and their stock from Mailship API.
+    Returns dict keyed by internalSku: {sku, ean, stock, msp_id}
+    """
+    import urllib.request as _req
+    import json as _json
+
+    if not MSP_LOGIN or not MSP_PASSWORD or not MSP_WAREHOUSE_ID:
+        print("[MSP] Credentials not configured — skipping")
+        return {}
+
+    try:
+        token = get_msp_token()
+    except Exception as e:
+        print(f"[MSP] Auth failed: {e}")
+        return {}
+
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+
+    # 1) Fetch product list (paginated)
+    products = {}  # msp_id -> {sku, ean}
+    offset = 0
+    limit = 500
+    while True:
+        payload = _json.dumps({"limit": limit, "offset": offset,
+                               "select": ["id", "productSku", "internalSku"]}).encode()
+        r = _req.Request(f"{MSP_API_BASE}/product/list", data=payload,
+                         headers=headers, method="POST")
+        with _req.urlopen(r, timeout=15) as resp:
+            data = _json.loads(resp.read())
+        results = data.get("results", [])
+        for item in results:
+            products[item["id"]] = {"sku": item.get("internalSku", ""),
+                                    "ean": item.get("productSku", "")}
+        if len(results) < limit:
+            break
+        offset += limit
+
+    # 2) Fetch stock levels (paginated)
+    stock_map = {}  # msp_id -> available
+    offset = 0
+    while True:
+        payload = _json.dumps({"limit": limit, "offset": offset,
+                               "select": ["id", "product", "warehouse", "available"]}).encode()
+        r = _req.Request(f"{MSP_API_BASE}/product-stock/list", data=payload,
+                         headers=headers, method="POST")
+        with _req.urlopen(r, timeout=15) as resp:
+            data = _json.loads(resp.read())
+        results = data.get("results", [])
+        for item in results:
+            if item.get("warehouse") == MSP_WAREHOUSE_ID:
+                stock_map[item["product"]] = item.get("available", 0)
+        if len(results) < limit:
+            break
+        offset += limit
+
+    # 3) Join products + stock
+    inventory = {}
+    for msp_id, prod in products.items():
+        sku = prod["sku"]
+        if not sku:
+            continue
+        inventory[sku] = {
+            "sku": sku,
+            "ean": prod["ean"],
+            "stock": stock_map.get(msp_id, 0),
+            "msp_id": msp_id,
+        }
+
+    print(f"[MSP] Inventory loaded: {len(inventory)} SKUs")
+    return inventory
+
+
 def fetch_data_for_asin(asin):
     result = {}
     product_name = ""
@@ -332,6 +423,7 @@ DATA_CACHE = {
     "skus": {},                # SKU list
     "sku_data": {},            # per-ASIN data: {asin: (data, product_name, sku)}
     "shipment_plans": {},      # per-warehouse: {wh_key: shipments_dict}
+    "msp_inventory": {},       # MSP warehouse: {sku: {sku, ean, stock, msp_id}}
     "last_refresh": None,      # datetime of last full refresh
     "refreshing": False,       # True while background refresh is running
 }
@@ -375,6 +467,14 @@ def _refresh_cache():
         with _cache_lock:
             DATA_CACHE["skus"] = all_skus
         print(f"[Cache] SKU list ready: {len(all_skus)} ASINs ({round(time.time() - start, 1)}s)")
+
+        # 1b) Refresh MSP warehouse inventory
+        try:
+            msp_inv = get_msp_inventory()
+            with _cache_lock:
+                DATA_CACHE["msp_inventory"] = msp_inv
+        except Exception as e:
+            print(f"[Cache] MSP refresh failed: {e}")
 
         # 2) Compute shipment plans — uses cached inventory, only needs sales API calls
         for wh_key in WAREHOUSES:
@@ -547,12 +647,17 @@ SKU_TEMPLATE = """
         .wh-card.wh-UK { border-top-color: #8b5cf6; }
         .wh-card.wh-US { border-top-color: #f59e0b; }
         .wh-card.wh-CA { border-top-color: #ef4444; }
+        .wh-card.wh-MSP { border-top-color: #10b981; }
         .wh-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
         .wh-name { font-size: 16px; font-weight: 700; }
         .wh-EU .wh-name { color: #3b82f6; }
         .wh-UK .wh-name { color: #8b5cf6; }
         .wh-US .wh-name { color: #f59e0b; }
         .wh-CA .wh-name { color: #ef4444; }
+        .wh-MSP .wh-name { color: #10b981; }
+        .own-wh-section { margin-top: 32px; }
+        .own-wh-title { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 1.5px; color: #4b5563; margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid #1e2130; }
+        .msp-no-data { color: #4b5563; font-size: 13px; padding: 16px 0; }
         .wh-vel { font-size: 22px; font-weight: 700; color: #fff; }
         .wh-vel small { font-size: 11px; color: #6b7280; font-weight: 400; }
         .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 14px; }
@@ -713,6 +818,33 @@ SKU_TEMPLATE = """
             </div>
             {% endfor %}
         </div>
+        <div class="own-wh-section">
+            <div class="own-wh-title">Own Warehouses</div>
+            {% if msp_data %}
+            <div class="grid" style="grid-template-columns: repeat(1, 1fr); max-width: 340px;">
+                <div class="wh-card wh-MSP">
+                    <div class="wh-header">
+                        <div class="wh-name">MSP EU</div>
+                        <div class="wh-vel" style="color:#10b981;">{{ msp_data.stock }} <small>units</small></div>
+                    </div>
+                    <div class="metrics">
+                        <div class="metric stock"><div class="val">{{ msp_data.stock }}</div><div class="lbl">Stock</div></div>
+                        <div class="metric"><div class="val" style="color:#6b7280;">—</div><div class="lbl">Transit</div></div>
+                        <div class="metric"><div class="val" style="color:#6b7280;">—</div><div class="lbl">Plan</div></div>
+                    </div>
+                    <div style="text-align:center; color:#4b5563; font-size:12px; margin-top:8px;">
+                        EAN: {{ msp_data.ean or '—' }}
+                    </div>
+                    <div style="text-align:center; color:#374151; font-size:11px; margin-top:6px; padding:8px; background:#0f1117; border-radius:6px;">
+                        Velocity & replenishment coming soon
+                    </div>
+                </div>
+            </div>
+            {% else %}
+            <div class="msp-no-data">No MSP stock found for this SKU.</div>
+            {% endif %}
+        </div>
+
         {% else %}
         <div class="no-data">Select a product from the dropdown to view replenishment data.</div>
         {% endif %}
@@ -759,6 +891,13 @@ SHIPMENT_TEMPLATE = """
         .wh-btn.sel-UK { border-color: #8b5cf6; background: #2e1065; color: #a78bfa; }
         .wh-btn.sel-US { border-color: #f59e0b; background: #451a03; color: #fcd34d; }
         .wh-btn.sel-CA { border-color: #ef4444; background: #450a0a; color: #fca5a5; }
+        .wh-btn.sel-MSP { border-color: #10b981; background: #064e3b; color: #6ee7b7; }
+        .wh-divider { width: 1px; background: #2d3040; height: 36px; align-self: center; }
+        .msp-table th { background: #161822; color: #6b7280; font-weight: 600; text-transform: uppercase; font-size: 10px; letter-spacing: 0.5px; padding: 10px; text-align: center; border-bottom: 2px solid #2d3040; }
+        .msp-table th:first-child, .msp-table td:first-child { text-align: left; }
+        .msp-table td { padding: 10px; text-align: center; border-bottom: 1px solid #1a1d27; font-size: 13px; }
+        .msp-table tr:hover { background: #1a1d2799; }
+        .msp-note { background: #064e3b22; border: 1px solid #10b98133; border-radius: 8px; padding: 10px 16px; color: #6ee7b7; font-size: 12px; margin-bottom: 16px; text-align: center; }
 
         .channel-section { margin-bottom: 28px; }
         .channel-header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; padding-bottom: 8px; border-bottom: 2px solid #1e2130; }
@@ -811,9 +950,50 @@ SHIPMENT_TEMPLATE = """
             {{ wh_labels[wk] }}
         </a>
         {% endfor %}
+        <div class="wh-divider"></div>
+        <a href="/shipments?wh=MSP" class="wh-btn {% if selected_wh == 'MSP' %}sel-MSP{% endif %}">
+            MSP EU
+        </a>
     </div>
 
-    {% if shipments %}
+    {% if selected_wh == 'MSP' %}
+        {% if msp_inventory %}
+        <div class="msp-note">Velocity & replenishment calculations coming soon — showing current stock only.</div>
+        <div class="summary-bar">
+            <div class="summary-item" style="border-top:3px solid #10b981;">
+                <div class="s-val" style="color:#10b981;">{{ msp_inventory|length }}</div>
+                <div class="s-lbl">Total SKUs</div>
+            </div>
+            <div class="summary-item" style="border-top:3px solid #10b981;">
+                <div class="s-val" style="color:#10b981;">{{ msp_inventory.values()|sum(attribute='stock') }}</div>
+                <div class="s-lbl">Total Stock</div>
+            </div>
+        </div>
+        <table class="msp-table">
+            <thead><tr>
+                <th>SKU</th>
+                <th>EAN</th>
+                <th>Stock</th>
+                <th>Velocity</th>
+                <th>Replenishment</th>
+            </tr></thead>
+            <tbody>
+            {% for sku, item in msp_inventory.items()|sort(attribute='1.stock', reverse=True) %}
+            <tr>
+                <td class="sku-cell">{{ item.sku }}</td>
+                <td style="font-family:monospace;color:#6b7280;font-size:11px;">{{ item.ean }}</td>
+                <td class="num-green">{{ item.stock }}</td>
+                <td style="color:#4b5563;">—</td>
+                <td style="color:#4b5563; font-size:11px;">Coming soon</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="loading"><span class="spinner"></span>Loading MSP inventory...</div>
+        {% endif %}
+
+    {% elif shipments %}
     <div class="summary-bar">
         {% for ch in ["AIR", "TRUCK", "SEA"] %}
         {% if shipments[ch] is defined %}
@@ -890,12 +1070,12 @@ SHIPMENT_TEMPLATE = """
     {% endif %}
     {% endfor %}
 
-    {% elif selected_wh and not shipments %}
+    {% elif selected_wh and selected_wh != 'MSP' and not shipments %}
     <div class="loading">
         <span class="spinner"></span>
         Loading {{ wh_labels[selected_wh] }} shipment data... This page will auto-refresh.
     </div>
-    {% else %}
+    {% elif selected_wh != 'MSP' %}
     <div class="no-data">Select a warehouse above to see all ASINs that need replenishment, grouped by shipping channel.</div>
     {% endif %}
 
@@ -905,7 +1085,7 @@ SHIPMENT_TEMPLATE = """
         &middot; Auto-refresh every {{ cache_minutes }}min
         &middot; <a href="#" onclick="fetch('/refresh').then(r=>r.json()).then(d=>alert(d.status==='already refreshing'?'Already refreshing...':'Refresh started!'))" style="color:#3b82f6;text-decoration:none;">Refresh Now</a>
     </div>
-    {% if selected_wh and not shipments %}
+    {% if selected_wh and selected_wh != 'MSP' and not shipments %}
     <script>
         // Auto-refresh every 15 seconds while waiting for data
         setTimeout(function(){ window.location.reload(); }, 15000);
@@ -951,13 +1131,17 @@ def dashboard():
     product_name = ""
     sku = ""
 
+    msp_data = None
+
     if selected_asin:
         with _cache_lock:
             cached = DATA_CACHE["sku_data"].get(selected_asin)
+            msp_inv = DATA_CACHE["msp_inventory"]
 
         if cached:
             data, product_name, sku = cached
             data = _convert_inf(data)
+            msp_data = msp_inv.get(sku)
 
     wh_labels = {k: v["label"] for k, v in WAREHOUSES.items()}
     if last_refresh:
@@ -970,6 +1154,7 @@ def dashboard():
         page="sku",
         sku_list=sku_list, selected_asin=selected_asin,
         data=data, product_name=product_name[:80] if product_name else "", sku=sku,
+        msp_data=msp_data,
         safety_days=SAFETY_STOCK_DAYS, wh_labels=wh_labels,
         timestamp=ts, refreshing=refreshing, cache_minutes=CACHE_REFRESH_MINUTES,
     )
@@ -983,6 +1168,11 @@ def shipments():
         selected_wh = request.args.get("wh", "EU")  # Default to EU
         wh_labels = {k: v["label"] for k, v in WAREHOUSES.items()}
         shipments_data = None
+        msp_inventory = None
+
+        if selected_wh == "MSP":
+            with _cache_lock:
+                msp_inventory = copy.deepcopy(DATA_CACHE["msp_inventory"])
 
         if selected_wh and selected_wh in WAREHOUSES:
             with _cache_lock:
@@ -1016,6 +1206,7 @@ def shipments():
             page="shipments",
             selected_wh=selected_wh,
             shipments=shipments_data,
+            msp_inventory=msp_inventory,
             wh_labels=wh_labels,
             timestamp=ts, refreshing=refreshing, cache_minutes=CACHE_REFRESH_MINUTES,
         )
