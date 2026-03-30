@@ -525,6 +525,25 @@ def _schedule_refresh():
     t.start()
 
 
+def _refresh_msp_only():
+    """Refresh only MSP inventory, independently from Amazon."""
+    try:
+        msp_inv = get_msp_inventory()
+        with _cache_lock:
+            DATA_CACHE["msp_inventory"] = msp_inv
+    except Exception as e:
+        print(f"[MSP] Standalone refresh failed: {e}")
+
+
+def _ensure_msp_cache():
+    """Trigger MSP refresh if not yet loaded (non-blocking)."""
+    with _cache_lock:
+        already_loaded = bool(DATA_CACHE["msp_inventory"])
+    if not already_loaded:
+        thread = threading.Thread(target=_refresh_msp_only, daemon=True)
+        thread.start()
+
+
 def _ensure_cache():
     """Trigger first refresh if cache is empty (non-blocking after first call)."""
     with _cache_lock:
@@ -1530,11 +1549,13 @@ def _maybe_start_background():
 # This runs when gunicorn imports the module, so data starts loading
 # before any user request arrives (saves 5-10 min wait on first visit)
 threading.Thread(target=_refresh_cache, daemon=True).start()
+threading.Thread(target=_refresh_msp_only, daemon=True).start()
 print("[Boot] Cache refresh started eagerly at import time")
 
 
 @app.route("/msp")
 def msp_view():
+    _ensure_msp_cache()
     with _cache_lock:
         msp_inv = copy.deepcopy(DATA_CACHE["msp_inventory"])
         last_refresh = DATA_CACHE["last_refresh"]
