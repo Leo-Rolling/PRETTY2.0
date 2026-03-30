@@ -613,6 +613,7 @@ NAV_HTML = """
 <div class="nav">
     <a href="/" class="{{ 'active' if page == 'sku' else '' }}">SKU View</a>
     <a href="/shipments" class="{{ 'active' if page == 'shipments' else '' }}">Shipment Planner</a>
+    <a href="/msp" class="{{ 'active' if page == 'msp' else '' }}" style="{{ 'background:#064e3b;border-color:#10b981;color:#6ee7b7;' if page == 'msp' else 'border-color:#10b981;color:#10b981;' }}">MSP Warehouse</a>
     <a href="#" onclick="sendAlert()" style="background:#7f1d1d;border-color:#ef4444;color:#fca5a5;">Send Alert Email</a>
     <a href="/preview-alert" target="_blank" style="border-color:#6b7280;">Preview Alert</a>
 </div>
@@ -624,6 +625,94 @@ function sendAlert(){
     });
 }
 </script>
+"""
+
+
+# ── MSP SKU view template ────────────────────────────────────────────
+
+MSP_SKU_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PRETTY 2.0 - MSP View</title>
+    <style>
+        """ + SHARED_CSS + """
+        .product-info { text-align: center; margin-bottom: 20px; }
+        .product-info .name { font-size: 16px; color: #e5e7eb; font-weight: 600; }
+        .product-info .sub { font-family: monospace; color: #6b7280; font-size: 13px; }
+        .msp-card { background: #1a1d27; border-radius: 10px; padding: 24px; border-top: 3px solid #10b981; max-width: 500px; margin: 0 auto; }
+        .msp-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        .msp-name { font-size: 18px; font-weight: 700; color: #10b981; }
+        .msp-stock-big { font-size: 48px; font-weight: 700; color: #10b981; text-align: center; margin: 20px 0 4px; }
+        .msp-stock-lbl { text-align: center; font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 20px; }
+        .msp-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .msp-meta-item { background: #0f1117; border-radius: 6px; padding: 12px; text-align: center; }
+        .msp-meta-item .val { font-size: 15px; font-weight: 600; color: #e5e7eb; }
+        .msp-meta-item .lbl { font-size: 10px; color: #6b7280; text-transform: uppercase; margin-top: 3px; }
+        .coming-soon { background: #064e3b22; border: 1px solid #10b98133; border-radius: 8px; padding: 12px; text-align: center; color: #6ee7b7; font-size: 12px; margin-top: 16px; }
+    </style>
+</head>
+<body>
+    <h1>PRETTY 2.0</h1>
+    <p class="subtitle">MSP Warehouse</p>
+    """ + NAV_HTML + """
+    <div class="controls">
+        <label>SKU:</label>
+        <select id="skuSelect" onchange="loadSku()" style="min-width:400px;">
+            <option value="">-- Select a SKU --</option>
+            {% for item in sku_list %}
+            <option value="{{ item.sku }}" {% if item.sku == selected_sku %}selected{% endif %}>
+                {{ item.sku }} | EAN: {{ item.ean }} | Stock: {{ item.stock }}
+            </option>
+            {% endfor %}
+        </select>
+    </div>
+
+    <div id="content">
+    {% if selected and item %}
+        <div class="product-info">
+            <div class="name">{{ item.sku }}</div>
+            <div class="sub">EAN: {{ item.ean }}</div>
+        </div>
+        <div class="msp-card">
+            <div class="msp-header">
+                <div class="msp-name">MSP EU</div>
+                <div style="font-size:12px;color:#6b7280;">Own Warehouse</div>
+            </div>
+            <div class="msp-stock-big">{{ item.stock }}</div>
+            <div class="msp-stock-lbl">Units in stock</div>
+            <div class="msp-meta">
+                <div class="msp-meta-item">
+                    <div class="val">{{ item.ean or '—' }}</div>
+                    <div class="lbl">EAN</div>
+                </div>
+                <div class="msp-meta-item">
+                    <div class="val">{{ item.sku }}</div>
+                    <div class="lbl">Internal SKU</div>
+                </div>
+            </div>
+            <div class="coming-soon">Velocity & replenishment calculations coming soon</div>
+        </div>
+    {% elif not sku_list %}
+        <div class="loading"><span class="spinner"></span>Loading MSP inventory...</div>
+    {% else %}
+        <div class="no-data">Select a SKU from the dropdown to view stock data.</div>
+    {% endif %}
+    </div>
+
+    <div class="timestamp">
+        MSP data cached: {{ timestamp }}
+        &middot; <a href="#" onclick="fetch('/refresh').then(r=>r.json()).then(d=>alert('Refresh started!'))" style="color:#3b82f6;text-decoration:none;">Refresh Now</a>
+    </div>
+    <script>
+        function loadSku() {
+            var sku = document.getElementById('skuSelect').value;
+            if (!sku) return;
+            window.location.href = '/msp?sku=' + encodeURIComponent(sku);
+        }
+    </script>
+</body>
+</html>
 """
 
 
@@ -1442,6 +1531,29 @@ def _maybe_start_background():
 # before any user request arrives (saves 5-10 min wait on first visit)
 threading.Thread(target=_refresh_cache, daemon=True).start()
 print("[Boot] Cache refresh started eagerly at import time")
+
+
+@app.route("/msp")
+def msp_view():
+    with _cache_lock:
+        msp_inv = copy.deepcopy(DATA_CACHE["msp_inventory"])
+        last_refresh = DATA_CACHE["last_refresh"]
+
+    selected_sku = request.args.get("sku", "")
+    sku_list = sorted(msp_inv.values(), key=lambda x: x["sku"])
+    item = msp_inv.get(selected_sku) if selected_sku else None
+
+    ts = last_refresh.strftime("%Y-%m-%d %H:%M UTC") if last_refresh else "Loading..."
+
+    return render_template_string(
+        MSP_SKU_TEMPLATE,
+        page="msp",
+        sku_list=sku_list,
+        selected_sku=selected_sku,
+        selected=bool(selected_sku),
+        item=item,
+        timestamp=ts,
+    )
 
 
 @app.errorhandler(Exception)
