@@ -1577,6 +1577,38 @@ def msp_view():
     )
 
 
+@app.route("/api/msp-debug")
+def msp_debug():
+    """Debug endpoint to test MSP API connection."""
+    import urllib.request as _req
+    import json as _json
+    result = {
+        "env": {
+            "MSP_LOGIN": bool(MSP_LOGIN),
+            "MSP_PASSWORD": bool(MSP_PASSWORD),
+            "MSP_WAREHOUSE_ID": MSP_WAREHOUSE_ID or "NOT SET",
+        },
+        "cached_skus": len(DATA_CACHE["msp_inventory"]),
+    }
+    try:
+        token = get_msp_token()
+        result["auth"] = "OK"
+        result["token_preview"] = token[:20] + "..."
+    except Exception as e:
+        result["auth"] = f"FAILED: {e}"
+        return jsonify(result)
+    try:
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+        payload = _json.dumps({"limit": 5, "offset": 0, "select": ["id", "productSku", "internalSku"]}).encode()
+        r = _req.Request(f"{MSP_API_BASE}/product/list", data=payload, headers=headers, method="POST")
+        with _req.urlopen(r, timeout=15) as resp:
+            data = _json.loads(resp.read())
+        result["product_list"] = data
+    except Exception as e:
+        result["product_list_error"] = str(e)
+    return jsonify(result)
+
+
 @app.errorhandler(Exception)
 def handle_exception(e):
     """Show real error instead of generic 500 — helps debug on Render."""
