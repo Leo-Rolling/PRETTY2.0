@@ -1542,16 +1542,23 @@ print("[Boot] Cache refresh started eagerly at import time")
 
 @app.route("/msp")
 def msp_view():
-    _ensure_msp_cache()
     with _cache_lock:
         msp_inv = copy.deepcopy(DATA_CACHE["msp_inventory"])
-        last_refresh = DATA_CACHE["last_refresh"]
+
+    # If cache empty, fetch synchronously now
+    if not msp_inv:
+        try:
+            msp_inv = get_msp_inventory()
+            with _cache_lock:
+                DATA_CACHE["msp_inventory"] = msp_inv
+        except Exception as e:
+            print(f"[MSP] Sync fetch failed: {e}")
+            traceback.print_exc()
 
     selected_sku = request.args.get("sku", "")
     sku_list = sorted(msp_inv.values(), key=lambda x: x["sku"])
     item = msp_inv.get(selected_sku) if selected_sku else None
-
-    ts = last_refresh.strftime("%Y-%m-%d %H:%M UTC") if last_refresh else "Loading..."
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     return render_template_string(
         MSP_SKU_TEMPLATE,
