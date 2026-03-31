@@ -294,7 +294,7 @@ def get_msp_inventory():
             break
         offset += limit
 
-    # 2) Fetch stock levels (paginated)
+    # 2) Fetch stock levels (paginated) — sum across all warehouses
     stock_map = {}  # msp_id -> available
     offset = 0
     while True:
@@ -302,12 +302,13 @@ def get_msp_inventory():
                                "select": ["id", "product", "warehouse", "available"]}).encode()
         r = _req.Request(f"{MSP_API_BASE}/product-stock/list", data=payload,
                          headers=headers, method="POST")
-        with _req.urlopen(r, timeout=15) as resp:
+        with _req.urlopen(r, timeout=30) as resp:
             data = _json.loads(resp.read())
         results = data.get("results", [])
+        print(f"[MSP] Stock page offset={offset}: {len(results)} items, sample={results[:1]}")
         for item in results:
-            if item.get("warehouse") == MSP_WAREHOUSE_ID:
-                stock_map[item["product"]] = item.get("available", 0)
+            pid = item["product"]
+            stock_map[pid] = stock_map.get(pid, 0) + item.get("available", 0)
         if len(results) < limit:
             break
         offset += limit
