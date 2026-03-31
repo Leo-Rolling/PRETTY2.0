@@ -1606,6 +1606,15 @@ def msp_debug():
         result["product_list"] = data
     except Exception as e:
         result["product_list_error"] = str(e)
+    try:
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+        payload = _json.dumps({"limit": 5, "offset": 0, "select": ["id", "product", "warehouse", "available"]}).encode()
+        r = _req.Request(f"{MSP_API_BASE}/product-stock/list", data=payload, headers=headers, method="POST")
+        with _req.urlopen(r, timeout=15) as resp:
+            data = _json.loads(resp.read())
+        result["stock_list_sample"] = data
+    except Exception as e:
+        result["stock_list_error"] = str(e)
     return jsonify(result)
 
 
