@@ -1564,6 +1564,18 @@ def msp_view():
     )
 
 
+@app.route("/api/msp-refresh")
+def msp_refresh_now():
+    """Run MSP refresh synchronously and return result."""
+    try:
+        inv = get_msp_inventory()
+        with _cache_lock:
+            DATA_CACHE["msp_inventory"] = inv
+        return jsonify({"status": "ok", "skus_loaded": len(inv), "sample": list(inv.values())[:3]})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e), "trace": traceback.format_exc()})
+
+
 @app.route("/api/msp-debug")
 def msp_debug():
     """Debug endpoint to test MSP API connection."""
