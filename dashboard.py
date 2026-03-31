@@ -4,6 +4,7 @@ import time
 import copy
 import threading
 import traceback
+import requests
 import resend
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -246,24 +247,18 @@ def compute_shipping_plan(wh_key, velocity, stock, transit, plan):
 
 def get_msp_token():
     """Authenticate with Mailship API and return a bearer token."""
-    import urllib.request as _req
-    import json as _json
-    payload = _json.dumps({"login": MSP_LOGIN, "password": MSP_PASSWORD}).encode()
-    r = _req.Request(f"{MSP_API_BASE}/login/user", data=payload,
-                     headers={"Content-Type": "application/json"}, method="POST")
-    with _req.urlopen(r, timeout=15) as resp:
-        data = _json.loads(resp.read())
-    return data["token"]
+    resp = requests.post(f"{MSP_API_BASE}/login/user",
+                         json={"login": MSP_LOGIN, "password": MSP_PASSWORD},
+                         timeout=15)
+    resp.raise_for_status()
+    return resp.json()["token"]
 
 
 def get_msp_inventory():
     """Fetch all MSP products and their stock from Mailship API.
     Returns dict keyed by internalSku: {sku, ean, stock, msp_id}
     """
-    import urllib.request as _req
-    import json as _json
-
-    if not MSP_LOGIN or not MSP_PASSWORD or not MSP_WAREHOUSE_ID:
+    if not MSP_LOGIN or not MSP_PASSWORD:
         print("[MSP] Credentials not configured — skipping")
         return {}
 
@@ -273,38 +268,37 @@ def get_msp_inventory():
         print(f"[MSP] Auth failed: {e}")
         return {}
 
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+    headers = {"Authorization": f"Bearer {token}"}
+    limit = 500
 
     # 1) Fetch product list (paginated)
-    products = {}  # msp_id -> {sku, ean}
+    products = {}
     offset = 0
-    limit = 500
     while True:
-        payload = _json.dumps({"limit": limit, "offset": offset,
-                               "select": ["id", "productSku", "internalSku"]}).encode()
-        r = _req.Request(f"{MSP_API_BASE}/product/list", data=payload,
-                         headers=headers, method="POST")
-        with _req.urlopen(r, timeout=15) as resp:
-            data = _json.loads(resp.read())
-        results = data.get("results", [])
+        resp = requests.post(f"{MSP_API_BASE}/product/list", headers=headers,
+                             json={"limit": limit, "offset": offset,
+                                   "select": ["id", "productSku", "internalSku"]},
+                             timeout=15)
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
         for item in results:
             products[item["id"]] = {"sku": item.get("internalSku", ""),
                                     "ean": item.get("productSku", "")}
         if len(results) < limit:
             break
         offset += limit
+    print(f"[MSP] Products fetched: {len(products)}")
 
-    # 2) Fetch stock levels (paginated) — sum across all warehouses
-    stock_map = {}  # msp_id -> available
+    # 2) Fetch stock levels (paginated)
+    stock_map = {}
     offset = 0
     while True:
-        payload = _json.dumps({"limit": limit, "offset": offset,
-                               "select": ["id", "product", "warehouse", "available"]}).encode()
-        r = _req.Request(f"{MSP_API_BASE}/product-stock/list", data=payload,
-                         headers=headers, method="POST")
-        with _req.urlopen(r, timeout=30) as resp:
-            data = _json.loads(resp.read())
-        results = data.get("results", [])
+        resp = requests.post(f"{MSP_API_BASE}/product-stock/list", headers=headers,
+                             json={"limit": limit, "offset": offset,
+                                   "select": ["id", "product", "warehouse", "available"]},
+                             timeout=15)
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
         print(f"[MSP] Stock page offset={offset}: {len(results)} items, sample={results[:1]}")
         for item in results:
             pid = item["product"]
@@ -468,14 +462,6 @@ def _refresh_cache():
         with _cache_lock:
             DATA_CACHE["skus"] = all_skus
         print(f"[Cache] SKU list ready: {len(all_skus)} ASINs ({round(time.time() - start, 1)}s)")
-
-        # 1b) Refresh MSP warehouse inventory
-        try:
-            msp_inv = get_msp_inventory()
-            with _cache_lock:
-                DATA_CACHE["msp_inventory"] = msp_inv
-        except Exception as e:
-            print(f"[Cache] MSP refresh failed: {e}")
 
         # 2) Compute shipment plans — uses cached inventory, only needs sales API calls
         for wh_key in WAREHOUSES:
@@ -1581,8 +1567,6 @@ def msp_view():
 @app.route("/api/msp-debug")
 def msp_debug():
     """Debug endpoint to test MSP API connection."""
-    import urllib.request as _req
-    import json as _json
     result = {
         "env": {
             "MSP_LOGIN": bool(MSP_LOGIN),
@@ -1598,22 +1582,19 @@ def msp_debug():
     except Exception as e:
         result["auth"] = f"FAILED: {e}"
         return jsonify(result)
+    headers = {"Authorization": f"Bearer {token}"}
     try:
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
-        payload = _json.dumps({"limit": 5, "offset": 0, "select": ["id", "productSku", "internalSku"]}).encode()
-        r = _req.Request(f"{MSP_API_BASE}/product/list", data=payload, headers=headers, method="POST")
-        with _req.urlopen(r, timeout=15) as resp:
-            data = _json.loads(resp.read())
-        result["product_list"] = data
+        r = requests.post(f"{MSP_API_BASE}/product/list", headers=headers,
+                          json={"limit": 5, "offset": 0, "select": ["id", "productSku", "internalSku"]},
+                          timeout=15)
+        result["product_list"] = r.json()
     except Exception as e:
         result["product_list_error"] = str(e)
     try:
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
-        payload = _json.dumps({"limit": 5, "offset": 0, "select": ["id", "product", "warehouse", "available"]}).encode()
-        r = _req.Request(f"{MSP_API_BASE}/product-stock/list", data=payload, headers=headers, method="POST")
-        with _req.urlopen(r, timeout=15) as resp:
-            data = _json.loads(resp.read())
-        result["stock_list_sample"] = data
+        r = requests.post(f"{MSP_API_BASE}/product-stock/list", headers=headers,
+                          json={"limit": 5, "offset": 0, "select": ["id", "product", "warehouse", "available"]},
+                          timeout=15)
+        result["stock_list_sample"] = r.json()
     except Exception as e:
         result["stock_list_error"] = str(e)
     return jsonify(result)
